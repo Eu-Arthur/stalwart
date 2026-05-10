@@ -10,8 +10,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/stalwart-foundationdb
-  FDB_VERSION_RANGE: "7.3"
+  IMAGE_REPO: stalwart-foundationdb
+  FDB_VERSION_RANGE: "7.4"
 
 jobs:
   sync-and-build:
@@ -46,7 +46,17 @@ jobs:
 
       - name: Restore custom Dockerfile
         run: |
-          git checkout ${{ github.ref_name }} -- Dockerfile.foundationdb || true
+          git checkout origin/main -- Dockerfile.foundationdb
+
+      - name: Build lowercase image env
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/${IMAGE_REPO}" >> "$GITHUB_ENV"
+
+      - name: Show build variables
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME}"
+          echo "FDB_VERSION_RANGE=${FDB_VERSION_RANGE}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

@@ -24,6 +24,10 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Save custom Dockerfile
+        run: |
+          cp Dockerfile.fdb /tmp/Dockerfile.fdb
+
       - name: Add upstream and fetch tags
         run: |
           git remote add upstream https://github.com/stalwartlabs/stalwart.git || true
@@ -46,7 +50,7 @@ jobs:
 
       - name: Restore custom Dockerfile
         run: |
-          git checkout origin/main -- Dockerfile.foundationdb
+          cp /tmp/Dockerfile.fdb ./Dockerfile.fdb
 
       - name: Build lowercase image env
         run: |
@@ -89,7 +93,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.foundationdb
+          file: ./Dockerfile.fdb
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |

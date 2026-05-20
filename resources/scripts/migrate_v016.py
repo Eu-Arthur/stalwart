@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -416,7 +417,7 @@ def split_email(addr: str) -> tuple[str, str] | None:
         return None
     return (local, domain)
 
-_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+_LABEL_RE = re.compile(r"^[^\W_](?:(?:[^\W_]|-){0,61}[^\W_])?$")
 _RFC6761_RESERVED_TLDS = {"test", "local", "localhost", "invalid", "example"}
 
 def is_valid_domain_name(name: str) -> bool:
@@ -637,6 +638,57 @@ def secret_text(value: str | None) -> dict[str, Any]:
         return {"@type": "None"}
     return {"@type": "Text", "secret": value}
 
+_MACRO_RE = re.compile(r"%\{(cfg|env|file):([^}]*)\}%")
+
+def resolve_macros(
+    value: str | None,
+    settings: dict[str, str],
+    _seen: frozenset[str] = frozenset(),
+) -> tuple[str | None, list[str]]:
+    if value is None or "%{" not in value:
+        return value, []
+    errors: list[str] = []
+
+    def repl(m: "re.Match[str]") -> str:
+        kind = m.group(1)
+        arg = m.group(2).strip()
+        if kind == "cfg":
+            if arg in _seen:
+                errors.append(f"circular %{{cfg:{arg}}}% reference")
+                return ""
+            raw = settings.get(arg)
+            if raw is None:
+                errors.append(f"unknown setting referenced by %{{cfg:{arg}}}%")
+                return ""
+            nested, nested_errors = resolve_macros(
+                raw, settings, _seen | {arg}
+            )
+            errors.extend(nested_errors)
+            return nested or ""
+        if kind == "env":
+            env = os.environ.get(arg)
+            if env is None:
+                errors.append(
+                    f"environment variable {arg!r} (from %{{env:{arg}}}%) "
+                    f"is not set"
+                )
+                return ""
+            return env
+        try:
+            with open(arg, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as exc:
+            errors.append(f"cannot read file {arg!r} (from %{{file:...}}%): {exc}")
+            return ""
+
+    prev = value
+    for _ in range(8):
+        cur = _MACRO_RE.sub(repl, prev)
+        if cur == prev:
+            break
+        prev = cur
+    return prev, errors
+
 _REDIS_PROTOCOL_MAP = {
     "resp2": "resp2",
     "resp3": "resp3",
@@ -721,6 +773,8 @@ class Converter:
         blob_store = self._build_blob_store()
         in_memory_store = self._build_in_memory_store()
         search_store = self._build_search_store()
+        metrics_store = self._build_metrics_store()
+        tracing_store = self._build_tracing_store()
         enterprise = self._build_enterprise()
         system_settings = self._build_system_settings()
 
@@ -737,6 +791,10 @@ class Converter:
             out["InMemoryStore"] = in_memory_store
         if search_store is not None:
             out["SearchStore"] = search_store
+        if metrics_store is not None:
+            out["MetricsStore"] = metrics_store
+        if tracing_store is not None:
+            out["TracingStore"] = tracing_store
         if tenants:
             out["Tenant"] = tenants
         if domains:
@@ -870,6 +928,7 @@ class Converter:
             if parts and parts[1]:
                 return parts[1]
 
+        fallback: str | None = None
         for addr in pv_list(p.get("emails")):
             if not isinstance(addr, str):
                 continue
@@ -877,9 +936,30 @@ class Converter:
             if parts is None:
                 continue
             local, dom = parts
-            if local and local == nm and dom:
+            if not dom:
+                continue
+            if local and local == nm:
                 return dom
-        return None
+            if fallback is None:
+                fallback = dom
+        return fallback
+
+    def _tenant_default_domain_cid(self, p: dict[str, Any]) -> str | None:
+        tname = pv_string(p.get("tenant"))
+        if not tname:
+            return None
+        t_cid = self.tenant_name_to_cid.get(tname)
+        if t_cid is None:
+            return None
+        candidates = [
+            (self.domain_cid_to_name.get(cid, ""), cid)
+            for cid, owner in self.domain_cid_to_tenant_cid.items()
+            if owner == t_cid
+        ]
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
     def _resolve_name_and_domain(self, p: dict[str, Any]) -> tuple[str, str]:
         nm = pv_string(p.get("name"))
@@ -898,6 +978,10 @@ class Converter:
             if dom not in self.domain_name_to_cid:
                 raise ConvertError(f"domain {dom!r} missing from domain index")
             return (nm, self.domain_name_to_cid[dom])
+
+        tenant_default = self._tenant_default_domain_cid(p)
+        if tenant_default is not None:
+            return (nm, tenant_default)
 
         if self.default_domain_cid is None:
             raise ConvertError(
@@ -1126,11 +1210,30 @@ class Converter:
             canon = sub.get("canonicalization", "relaxed/relaxed").strip().lower()
             if not canon:
                 canon = "relaxed/relaxed"
+            private_key, key_errors = resolve_macros(
+                sub.get("private-key"), self.settings
+            )
+            if private_key is not None:
+                private_key = private_key.strip()
+            if key_errors:
+                print(
+                    f"warning: skipping DKIM signature {sid!r}: could not "
+                    f"resolve private-key: {'; '.join(key_errors)}",
+                    file=sys.stderr,
+                )
+                continue
+            if not private_key or "%{" in private_key:
+                print(
+                    f"warning: skipping DKIM signature {sid!r}: private-key is "
+                    f"empty or still contains an unresolved macro",
+                    file=sys.stderr,
+                )
+                continue
             body: dict[str, Any] = {
                 "@type": tag,
                 "canonicalization": canon,
                 "domainId": "#" + dom_cid,
-                "privateKey": secret_text(sub.get("private-key")),
+                "privateKey": secret_text(private_key),
                 "selector": selector,
             }
             t_cid = self.domain_cid_to_tenant_cid.get(dom_cid)
@@ -1175,6 +1278,19 @@ class Converter:
             f"(DataStore requires rocksdb/sqlite/foundationdb/postgresql/mysql)"
         )
 
+    def _is_same_kv_store_as_data(self, sub: dict[str, str]) -> bool:
+        data_sid = self._referenced_store_id("storage.data")
+        if data_sid is None:
+            return False
+        data_sub = self._stores().get(data_sid)
+        if data_sub is None:
+            return False
+        if data_sub.get("type", "").strip().lower() != sub.get("type", "").strip().lower():
+            return False
+        data_path = data_sub.get("path", "").strip()
+        sub_path = sub.get("path", "").strip()
+        return bool(data_path) and data_path == sub_path
+
     def _build_blob_store(self) -> dict[str, Any] | None:
         sid = self._referenced_store_id("storage.blob")
         if sid is None:
@@ -1201,8 +1317,21 @@ class Converter:
             return self._build_postgresql(sub, for_blob=True)
         if stype == "mysql":
             return self._build_mysql(sub, for_blob=True)
-
-        return {"@type": "Default"}
+        if stype in ("rocksdb", "sqlite"):
+            if self._is_same_kv_store_as_data(sub):
+                return {"@type": "Default"}
+            raise ConvertError(
+                f"storage.blob points at store {sid!r} of type {stype!r}, "
+                f"but v0.16 does not support a separate {stype} blob store. "
+                "Consolidate blob data into the data store, or configure a "
+                "filesystem/s3/azure/foundationdb/postgresql/mysql blob "
+                "store and migrate the blobs before running this script."
+            )
+        raise ConvertError(
+            f"storage.blob points at store {sid!r} of unsupported type "
+            f"{stype!r} (BlobStore requires s3/azure/fs/foundationdb/"
+            "postgresql/mysql, or rocksdb/sqlite sharing the data store path)"
+        )
 
     def _build_in_memory_store(self) -> dict[str, Any] | None:
         sid = self._referenced_store_id("storage.lookup")
@@ -1249,7 +1378,74 @@ class Converter:
             return self._build_postgresql(sub, for_search=True)
         if stype == "mysql":
             return self._build_mysql(sub, for_search=True)
-        return {"@type": "Default"}
+        if stype in ("rocksdb", "sqlite"):
+            if self._is_same_kv_store_as_data(sub):
+                return {"@type": "Default"}
+            raise ConvertError(
+                f"storage.fts points at store {sid!r} of type {stype!r}, "
+                f"but v0.16 does not support a separate {stype} search "
+                "store. Consolidate the full-text index into the data store, "
+                "or configure an elasticsearch/meilisearch/foundationdb/"
+                "postgresql/mysql search store before running this script."
+            )
+        raise ConvertError(
+            f"storage.fts points at store {sid!r} of unsupported type "
+            f"{stype!r} (SearchStore requires elasticsearch/meilisearch/"
+            "foundationdb/postgresql/mysql, or rocksdb/sqlite sharing the "
+            "data store path)"
+        )
+
+    def _build_history_store(
+        self, store_key: str, enable_key: str, role: str
+    ) -> dict[str, Any] | None:
+        enable = parse_bool(self.settings.get(enable_key))
+        sid = self._referenced_store_id(store_key)
+        if enable is False:
+            return {"@type": "Disabled"}
+        if sid is None:
+            if enable is True:
+                return {"@type": "Default"}
+            return None
+        data_sid = self._referenced_store_id("storage.data")
+        if sid == data_sid:
+            return {"@type": "Default"}
+        stores = self._stores()
+        if sid not in stores:
+            raise ConvertError(
+                f"{store_key} = {sid!r} but no store.{sid}.type is defined"
+            )
+        sub = stores[sid]
+        stype = sub.get("type", "").strip().lower()
+        if stype == "foundationdb":
+            return self._build_foundationdb(sub)
+        if stype == "postgresql":
+            return self._build_postgresql(sub)
+        if stype == "mysql":
+            return self._build_mysql(sub)
+        if stype in ("rocksdb", "sqlite"):
+            if self._is_same_kv_store_as_data(sub):
+                return {"@type": "Default"}
+            raise ConvertError(
+                f"{store_key} points at store {sid!r} of type {stype!r}, "
+                f"but v0.16 does not support a separate {stype} {role} "
+                "store. Point this setting at the data store, or configure "
+                "a foundationdb/postgresql/mysql store."
+            )
+        raise ConvertError(
+            f"{store_key} points at store {sid!r} of unsupported type "
+            f"{stype!r} ({role} store requires foundationdb/postgresql/"
+            "mysql, or rocksdb/sqlite sharing the data store path)"
+        )
+
+    def _build_metrics_store(self) -> dict[str, Any] | None:
+        return self._build_history_store(
+            "metrics.history.store", "metrics.history.enable", "metrics"
+        )
+
+    def _build_tracing_store(self) -> dict[str, Any] | None:
+        return self._build_history_store(
+            "tracing.history.store", "tracing.history.enable", "tracing"
+        )
 
     def _build_rocksdb(self, sub: dict[str, str]) -> dict[str, Any]:
         path = sub.get("path", "").strip()
@@ -1562,8 +1758,21 @@ class Converter:
         for sid, sub in sorted(
             build_sub_trees(self.settings, "certificate", "cert").items()
         ):
-            cert = sub.get("cert", "").strip()
-            key = sub.get("private-key", "").strip()
+            cert, cert_errors = resolve_macros(
+                sub.get("cert", ""), self.settings
+            )
+            key, key_errors = resolve_macros(
+                sub.get("private-key", ""), self.settings
+            )
+            cert = (cert or "").strip()
+            key = (key or "").strip()
+            if cert_errors or key_errors:
+                print(
+                    f"warning: skipping certificate.{sid}: could not resolve "
+                    f"value: {'; '.join(cert_errors + key_errors)}",
+                    file=sys.stderr,
+                )
+                continue
             if not cert or not key:
                 print(
                     f"warning: skipping certificate.{sid}: "
@@ -1766,6 +1975,8 @@ SINGLETON_ORDER = [
     "BlobStore",
     "InMemoryStore",
     "SearchStore",
+    "MetricsStore",
+    "TracingStore",
 ]
 
 COLLECTION_ORDER = [

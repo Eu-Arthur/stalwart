@@ -2,7 +2,38 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [0.16.5] - 2026-05-XX
+## [0.16.6] - 2026-05-20
+
+If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.
+
+## Added
+- Added 58 new DNS provider integrations (see [dns-update](https://github.com/stalwartlabs/dns-update/blob/main/CHANGELOG.md#dns-update-040) crate for details).
+- DNS updater: Log DNS record types and values.
+- Sieve: Allow User Sieve scripts to access `orcpt`.
+- MTA: Log when messages are rejected or discarded by the spam classifier.
+
+## Changed
+- Bump JMAP File Storage to [draft-ietf-jmap-filenode-14](https://datatracker.ietf.org/doc/html/draft-ietf-jmap-filenode-14).
+- Accept password hashes with `$` or `{` prefixes as secure secrets.
+
+## Fixed
+- DAV: `acl-principal-prop-set` REPORT enforced the wrong privilege.
+- JMAP: `Thread/get` did not filter by per-mailbox ACLs on shared accounts.
+- IMAP: `UID FETCH N:*` could miss messages moved into a SELECTed mailbox by another connection.
+- DNS updater:
+  - Skip `v=spf1 a -all` records for apex domains.
+  - RFC2136 TSIG: regression related to multiplexer.
+  - Route53: Chunk `TXT` records when they exceed 255 characters.
+- ACME: 
+  - Update `defaultCertificateId` when renewing a certificate that is currently set as default.
+  - Perform `DNS-01` authorizations sequentially to avoid race conditions in some DNS providers.
+- Allow internal TLDs and special characters in e-mail addresses.
+- Websocket: Perform case insensitive matching during upgrade.
+- LDAP: Synchronize accounts when expanding mailing list recipients.
+- Sieve: `replace` action adds an extra `From` header.
+- ACL: Orphaned ACL entries for deleted accounts cause JMAP session errors.
+
+## [0.16.5] - 2026-05-11
 
 If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.
 
@@ -11,6 +42,7 @@ If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If
 
 ## Changed
 - Bump `mail-auth` to 0.9 (which bumps `hickory-resolver` to 0.26).
+- Deprecated RFC2136 SIG(0) support as it is no longer supported by `hickory`.
 
 ## Fixed
 - JMAP: 
@@ -25,7 +57,18 @@ If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If
 - ACME: 
   - Include apex domains when requesting certificates for subdomains.
   - Use the public suffix list to determine the zone name when no origin is provided.
-- MTA: Process reports using original `RCPT` before rewriting.
+- MTA:
+  - Allow rescheduling recipients with permanent failures.
+  - Process reports using original `RCPT` before rewriting.
+- Autodiscover v2 endpoint unreachable.
+- DNS update (via `dns-update` crate):
+  - OVH + Google Cloud DNS: Fix FQDN handling for `MX` and `SRV` records.
+  - Route53: Fix changeset error resolution.
+  - deSEC: Use empty `subname` for apex records instead of `@`, which the API rejects.
+  - Cloudflare: Wrap `TXT` record content in double quotes (RFC 1035) to suppress dashboard warnings.
+- iCalendar/JSCalendar (via `calcard` crate):
+  - Support `STATUS:CANCELLED` mapping from `VTODO` to JSCalendar.
+  - Fixed duration parsing for zero duration `PT0S`.
 
 ## [0.16.4] - 2026-05-05
 

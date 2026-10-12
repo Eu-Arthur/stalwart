@@ -13,7 +13,7 @@ use common::{
     Server, USER_AGENT,
     config::smtp::{
         report::AggregateFrequency,
-        resolver::{Mode, MxPattern},
+        resolver::{Mode, MxPattern, TlsaMatching},
     },
     ipc::{TlsEvent, ToHash},
 };
@@ -128,10 +128,6 @@ impl TlsReporting for Server {
 
         // Try delivering report over HTTP
         for uri in report.http_rua.as_slice() {
-            if let Ok(client) = reqwest::Client::builder()
-                .user_agent(USER_AGENT)
-                .timeout(Duration::from_secs(2 * 60))
-                .build()
             {
                 #[cfg(feature = "test_mode")]
                 if uri == "https://127.0.0.1/tls" {
@@ -140,8 +136,13 @@ impl TlsReporting for Server {
                     return Ok(());
                 }
 
-                match client
+                match self
+                    .core
+                    .smtp
+                    .tls_report_client
                     .post(uri)
+                    .timeout(Duration::from_secs(2 * 60))
+                    .header(reqwest::header::USER_AGENT, USER_AGENT)
                     .header(CONTENT_TYPE, "application/tlsrpt+gzip")
                     .body(json.to_vec())
                     .send()
@@ -363,7 +364,11 @@ impl TlsReporting for Server {
                                     "{} {} {} {}",
                                     if entry.is_end_entity { 3 } else { 2 },
                                     i32::from(entry.is_spki),
-                                    if entry.is_sha256 { 1 } else { 2 },
+                                    match entry.matching {
+                                        TlsaMatching::Full => 0,
+                                        TlsaMatching::Sha256 => 1,
+                                        TlsaMatching::Sha512 => 2,
+                                    },
                                     entry.data.iter().fold(
                                         String::with_capacity(64),
                                         |mut s, b| {

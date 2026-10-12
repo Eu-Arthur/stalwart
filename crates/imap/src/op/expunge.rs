@@ -10,7 +10,7 @@ use ahash::AHashMap;
 use common::{network::SessionStream, storage::index::ObjectIndexBuilder};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
-    message::metadata::MessageData,
+    message::{delete::EmailDeletion, metadata::MessageData},
 };
 use imap_proto::{
     Command, ResponseCode, ResponseType, StatusResponse,
@@ -83,8 +83,16 @@ impl<T: SessionStream> Session<T> {
             _ => None,
         };
 
+        // RFC 9738 limits UID EXPUNGE but never a plain EXPUNGE
+        let message_limit = if is_uid {
+            self.server.core.imap.max_messages_per_command
+        } else {
+            u32::MAX
+        };
+
         // Expunge
-        data.expunge(mailbox.clone(), sequence, op_start)
+        let limited_uid = data
+            .expunge(mailbox.clone(), sequence, message_limit, op_start)
             .await
             .imap_ctx(&request.tag, trc::location!())?;
 
@@ -93,19 +101,33 @@ impl<T: SessionStream> Session<T> {
 
         // Synchronize messages
         let modseq = data
-            .write_mailbox_changes(&mailbox, self.is_qresync)
+            .write_mailbox_changes(&mailbox, self.is_qresync || self.is_uidonly)
             .await
             .imap_ctx(&request.tag, trc::location!())?;
         let mut response =
             StatusResponse::completed(Command::Expunge(is_uid)).with_tag(request.tag);
 
+        let mut untagged = Vec::new();
+        if let Some(uid) = limited_uid {
+            let code = ResponseCode::MessageLimit {
+                limit: message_limit,
+                uid: uid.into(),
+            };
+            if self.is_condstore {
+                untagged = StatusResponse::ok("Some messages were not expunged.")
+                    .with_code(code)
+                    .into_bytes();
+            } else {
+                response = response.with_code(code);
+            }
+        }
         if self.is_condstore {
             response = response.with_code(ResponseCode::HighestModseq {
                 modseq: modseq.to_modseq(),
             });
         }
 
-        self.write_bytes(response.into_bytes()).await
+        self.write_bytes(response.serialize(untagged)).await
     }
 }
 
@@ -114,8 +136,9 @@ impl<T: SessionStream> SessionData<T> {
         &self,
         mailbox: Arc<SelectedMailbox>,
         sequence: Option<AHashMap<u32, ImapId>>,
+        message_limit: u32,
         op_start: Instant,
-    ) -> trc::Result<()> {
+    ) -> trc::Result<Option<u32>> {
         // Obtain message ids
         let account_id = mailbox.id.account_id;
         let mut deleted_ids = RoaringBitmap::from_iter(
@@ -132,9 +155,37 @@ impl<T: SessionStream> SessionData<T> {
             deleted_ids &= RoaringBitmap::from_iter(sequence.keys());
         }
 
+        // RFC 9738 requires the highest UIDs to be processed first when truncating.
+        // Only messages the session has a UID for can be ordered, so the count that
+        // decides whether to truncate has to come from that same set.
+        let mut limited_uid = None;
+        if deleted_ids.len() > message_limit as u64 {
+            let mut uids = {
+                let state = mailbox.state.lock();
+                deleted_ids
+                    .iter()
+                    .filter_map(|id| state.id_to_imap.get(&id).map(|imap_id| (imap_id.uid, id)))
+                    .collect::<Vec<_>>()
+            };
+
+            if uids.len() > message_limit as usize {
+                let cutoff = uids.len() - message_limit as usize;
+                let (below, lowest, _) = uids.select_nth_unstable(cutoff);
+                limited_uid = Some(lowest.0);
+                for (_, id) in below {
+                    deleted_ids.remove(*id);
+                }
+            }
+        }
+
         // Delete ids
         let mut batch = BatchBuilder::new();
-        self.email_untag_or_delete(account_id, mailbox.id.mailbox_id, &deleted_ids, &mut batch)
+        let (fully_deleted, thread_ids) = self
+            .email_untag_or_delete(account_id, mailbox.id.mailbox_id, &deleted_ids, &mut batch)
+            .await
+            .caused_by(trc::location!())?;
+        self.server
+            .log_emptied_threads(account_id, &mut batch, thread_ids, &fully_deleted)
             .await
             .caused_by(trc::location!())?;
 
@@ -156,7 +207,7 @@ impl<T: SessionStream> SessionData<T> {
             self.server.notify_task_queue();
         }
 
-        Ok(())
+        Ok(limited_uid)
     }
 
     pub async fn email_untag_or_delete(
@@ -165,11 +216,13 @@ impl<T: SessionStream> SessionData<T> {
         mailbox_id: u32,
         deleted_ids: &RoaringBitmap,
         batch: &mut BatchBuilder,
-    ) -> trc::Result<()> {
+    ) -> trc::Result<(RoaringBitmap, RoaringBitmap)> {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Email);
 
+        let mut fully_deleted = RoaringBitmap::new();
+        let mut thread_ids = RoaringBitmap::new();
         self.server
             .archives(
                 account_id,
@@ -190,6 +243,8 @@ impl<T: SessionStream> SessionData<T> {
 
                         if metadata.inner.mailboxes.len() == 1 {
                             // Delete message
+                            fully_deleted.insert(document_id);
+                            thread_ids.insert(metadata.inner.thread_id.to_native());
                             batch
                                 .custom(
                                     ObjectIndexBuilder::<_, ()>::new()
@@ -228,6 +283,6 @@ impl<T: SessionStream> SessionData<T> {
             .await
             .caused_by(trc::location!())?;
 
-        Ok(())
+        Ok((fully_deleted, thread_ids))
     }
 }

@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::headers::{BuildHeader, ValueToHeader};
 use crate::{
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
@@ -13,6 +12,7 @@ use crate::{
 use common::{
     Server, auth::AccessToken, ipc::PushNotification, storage::index::ObjectIndexBuilder,
 };
+use email::message::headers::{BuildHeader, ValueToHeader};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess},
     mailbox::{JUNK_ID, TRASH_ID, UidMailbox},
@@ -28,7 +28,7 @@ use jmap_proto::{
     method::set::{SetRequest, SetResponse},
     object::email::{Email, EmailProperty, EmailValue},
     references::resolve::ResolveCreatedReference,
-    request::IntoValid,
+    request::MaybeInvalid,
     types::state::State,
 };
 use jmap_tools::{Key, Value};
@@ -117,7 +117,7 @@ impl EmailSet for Server {
         };
 
         let mut last_change_id = None;
-        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
+        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
 
         // Process creates
         'create: for (id, object) in request.unwrap_create() {
@@ -739,6 +739,19 @@ impl EmailSet for Server {
                 continue 'create;
             }
 
+            match builder
+                .headers
+                .iter()
+                .position(|(name, _)| name.eq_ignore_ascii_case("Message-ID"))
+            {
+                Some(pos) => {
+                    builder.headers[pos].0 = Cow::Borrowed("Message-ID");
+                }
+                None => {
+                    builder = builder.message_id(self.core.network.message_id());
+                }
+            }
+
             // In test, sort headers to avoid randomness
             #[cfg(feature = "test_mode")]
             {
@@ -792,7 +805,14 @@ impl EmailSet for Server {
         let mut batch = BatchBuilder::new();
         let mut changed_mailboxes: AHashMap<u32, Vec<u32>> = AHashMap::new();
         let mut will_update = Vec::with_capacity(request.update.as_ref().map_or(0, |u| u.len()));
-        'update: for (id, object) in request.unwrap_update().into_valid() {
+        'update: for (id, object) in request.unwrap_update() {
+            let id = match id {
+                MaybeInvalid::Value(id) => id,
+                invalid => {
+                    response.not_updated.append(invalid, SetError::not_found());
+                    continue 'update;
+                }
+            };
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -832,8 +852,11 @@ impl EmailSet for Server {
                         new_data.set_mailboxes(
                             ids.into_expanded_boolean_set()
                                 .filter_map(|id| {
-                                    UidMailbox::new_unassigned(
-                                        id.try_into_property()?.try_into_id()?.document_id(),
+                                    let mailbox_id =
+                                        id.try_into_property()?.try_into_id()?.document_id();
+                                    UidMailbox::new(
+                                        mailbox_id,
+                                        data.inner.message_uid(mailbox_id).unwrap_or(0),
                                     )
                                     .into()
                                 })
@@ -868,6 +891,17 @@ impl EmailSet for Server {
                                 response.not_updated.append(id, set_error);
                                 continue 'update;
                             }
+                        }
+                    }
+                    (Key::Property(EmailProperty::Id), value) => {
+                        if !crate::matches_id(&value, id) {
+                            response.not_updated.append(
+                                id,
+                                SetError::invalid_properties()
+                                    .with_property(EmailProperty::Id)
+                                    .with_description("The id property is immutable."),
+                            );
+                            continue 'update;
                         }
                     }
                     (property, _) => {

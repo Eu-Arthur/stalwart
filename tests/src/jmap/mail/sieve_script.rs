@@ -209,8 +209,24 @@ pub async fn test(test: &TestServer) {
     }
     assert_eq!(
         email.mailbox_ids().len(),
-        2,
-        "Expected 2 mailbox ids, found {:?}.",
+        3,
+        "Expected 3 mailbox ids, found {:?}.",
+        email.mailbox_ids()
+    );
+    let drafts_id = client
+        .mailbox_query(
+            mailbox::query::Filter::name("Drafts").into(),
+            None::<Vec<_>>,
+        )
+        .await
+        .unwrap()
+        .take_ids()
+        .pop()
+        .expect("Drafts mailbox not found.");
+    assert!(
+        email.mailbox_ids().contains(&drafts_id.as_str()),
+        "Drafts mailbox {} not found in {:?}.",
+        drafts_id,
         email.mailbox_ids()
     );
     for mailbox_pos in [mailbox_ids.len() - 1, mailbox_ids.len() - 2] {
@@ -335,6 +351,49 @@ pub async fn test(test: &TestServer) {
             "<>",
             ["<bill@remote.org>"],
             "@Rejected from an included script",
+        ),
+    )
+    .await;
+
+    client
+        .sieve_script_create(
+            "Test Script",
+            concat!(
+                "require \"reject\";\n",
+                "reject \"Rejected from a mixed-case included script.\";\n",
+                "stop;\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            false,
+        )
+        .await
+        .unwrap();
+    client
+        .sieve_script_create("test_include_case", get_script("test_include_case"), true)
+        .await
+        .unwrap();
+    lmtp.ingest(
+        "bill@remote.org",
+        &["jdoe@example.com"],
+        concat!(
+            "From: bill@remote.org\r\n",
+            "Bcc: Undisclosed recipients;\r\n",
+            "Message-ID: <5678@example.com>\r\n",
+            "Subject: Holidays\r\n",
+            "\r\n",
+            "Remember to file your T.P.S. reports before ",
+            "going on holidays."
+        ),
+    )
+    .await;
+
+    assert_message_delivery(
+        &mut smtp_rx,
+        MockMessage::new(
+            "<>",
+            ["<bill@remote.org>"],
+            "@Rejected from a mixed-case included script",
         ),
     )
     .await;

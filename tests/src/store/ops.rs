@@ -9,7 +9,7 @@ use ahash::AHashSet;
 use std::collections::HashSet;
 use store::{
     ValueKey,
-    rand::{self, Rng},
+    rand::{self, RngExt},
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, MergeResult, Params, ValueClass},
 };
 use types::collection::Collection;
@@ -123,6 +123,287 @@ pub async fn test(test: &TestServer) {
         )
         .await
         .unwrap();
+
+        // Read-your-writes through the cached read version: overwrite a key in a tight loop
+        println!("Running FoundationDB read-your-writes test...");
+        for n in 0u64..200 {
+            db.write(
+                BatchBuilder::new()
+                    .with_account_id(0)
+                    .with_collection(Collection::Email)
+                    .with_document(0)
+                    .set(
+                        ValueClass::Registry(RegistryClass::Item {
+                            object_id: 100,
+                            item_id: 0,
+                        }),
+                        n.to_be_bytes().to_vec(),
+                    )
+                    .build_all(),
+            )
+            .await
+            .unwrap();
+
+            let got = db
+                .get_value::<u64>(ValueKey {
+                    account_id: 0,
+                    collection: 0,
+                    document_id: 0,
+                    class: ValueClass::Registry(RegistryClass::Item {
+                        object_id: 100,
+                        item_id: 0,
+                    }),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, n, "stale read: wrote {n} but read back {got}");
+        }
+        db.write(
+            BatchBuilder::new()
+                .with_account_id(0)
+                .with_collection(Collection::Email)
+                .with_document(0)
+                .clear(ValueClass::Registry(RegistryClass::Item {
+                    object_id: 100,
+                    item_id: 0,
+                }))
+                .build_all(),
+        )
+        .await
+        .unwrap();
+
+        // Read-version cache monotonicity under concurrency: while a writer increments a counter
+        println!("Running FoundationDB read-version monotonicity test...");
+        let n_increments = 500u64;
+
+        let writer = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for _ in 0..n_increments {
+                    db.write(
+                        BatchBuilder::new()
+                            .with_account_id(0)
+                            .with_collection(Collection::Email)
+                            .with_document(5000)
+                            .add_and_get(ValueClass::Quota, 1)
+                            .build_all(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+        };
+
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let db = db.clone();
+            readers.push(tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+                let mut last = 0i64;
+                while std::time::Instant::now() < deadline {
+                    let current = db
+                        .get_counter(ValueKey {
+                            account_id: 0,
+                            collection: 0,
+                            document_id: 5000,
+                            class: ValueClass::Quota,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(
+                        current >= last,
+                        "read version regressed: counter went from {last} to {current}"
+                    );
+                    last = current;
+                }
+            }));
+        }
+
+        writer.await.unwrap();
+        for reader in readers {
+            reader.await.unwrap();
+        }
+
+        assert_eq!(
+            db.get_counter(ValueKey {
+                account_id: 0,
+                collection: 0,
+                document_id: 5000,
+                class: ValueClass::Quota,
+            })
+            .await
+            .unwrap(),
+            n_increments as i64,
+            "counter did not reach the expected total"
+        );
+        db.write(
+            BatchBuilder::new()
+                .with_account_id(0)
+                .with_collection(Collection::Email)
+                .with_document(5000)
+                .clear(ValueClass::Quota)
+                .build_all(),
+        )
+        .await
+        .unwrap();
+
+        // Overwriting a chunked value with a shorter one must not leave orphaned chunks behind
+        println!("Running FoundationDB orphaned chunk test...");
+        const ORPHAN_FIELD: u8 = 200;
+        let orphan_range = |document_id: u32| ValueKey {
+            account_id: 0,
+            collection: 0,
+            document_id,
+            class: ValueClass::Property(ORPHAN_FIELD),
+        };
+        let marker = value_gen([(b'z', 16)]);
+        db.write(
+            BatchBuilder::new()
+                .with_account_id(0)
+                .with_collection(Collection::Email)
+                .with_document(1)
+                .set(ValueClass::Property(ORPHAN_FIELD), marker.clone())
+                .build_all(),
+        )
+        .await
+        .unwrap();
+
+        for (byte, size) in [
+            (b'a', MAX_VALUE_SIZE * 3),
+            (b'b', MAX_VALUE_SIZE * 2),
+            (b'c', MAX_VALUE_SIZE / 2),
+            (b'd', MAX_VALUE_SIZE * 3 / 2),
+            (b'e', MAX_VALUE_SIZE),
+            (b'f', 1),
+            (b'g', MAX_VALUE_SIZE * 4),
+            (b'h', 0),
+        ] {
+            let value = value_gen([(byte, size)]);
+            db.write(
+                BatchBuilder::new()
+                    .with_account_id(0)
+                    .with_collection(Collection::Email)
+                    .with_document(0)
+                    .set(ValueClass::Property(ORPHAN_FIELD), value.clone())
+                    .build_all(),
+            )
+            .await
+            .unwrap();
+
+            let mut results = Vec::new();
+            db.iterate(
+                store::IterateParams::new(orphan_range(0), orphan_range(u32::MAX)),
+                |key, value| {
+                    results.push((key.to_vec(), value.to_vec()));
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                results.len(),
+                2,
+                "orphaned chunks surfaced as extra rows after writing {size} bytes"
+            );
+            assert_eq!(
+                results[0].1.len(),
+                value.len(),
+                "stale chunk spliced onto the value after writing {size} bytes"
+            );
+            assert_eq!(results[0].1, value, "value mismatch for {size} bytes");
+            assert_eq!(
+                results[1].1, marker,
+                "neighbouring document corrupted after writing {size} bytes"
+            );
+            assert_eq!(
+                results[0].0.len(),
+                results[1].0.len(),
+                "chunk key returned as a document key after writing {size} bytes"
+            );
+        }
+
+        // A short key sharing a subspace with longer structured keys must never clear them,
+        // as the database schema version does in the property subspace
+        println!("Running FoundationDB short key test...");
+        for document_id in [0u32, 1, 0xFFFF, 0x10000] {
+            db.write(
+                BatchBuilder::new()
+                    .with_account_id(document_id)
+                    .with_collection(Collection::Email)
+                    .with_document(document_id)
+                    .set(ValueClass::Property(ORPHAN_FIELD), marker.clone())
+                    .build_all(),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.write(
+            BatchBuilder::new()
+                .set(
+                    ValueClass::Any(store::write::AnyClass {
+                        subspace: store::SUBSPACE_PROPERTY,
+                        key: vec![0u8],
+                    }),
+                    vec![1u8],
+                )
+                .build_all(),
+        )
+        .await
+        .unwrap();
+
+        for document_id in [0u32, 1, 0xFFFF, 0x10000] {
+            let key = ValueKey {
+                account_id: document_id,
+                collection: 0,
+                document_id,
+                class: ValueClass::Property(ORPHAN_FIELD),
+            };
+            let mut found = Vec::new();
+            db.iterate(
+                store::IterateParams::new(key.clone(), key.clone()),
+                |_, value| {
+                    found.push(value.to_vec());
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                found,
+                vec![marker.clone()],
+                "property key for account {document_id} was cleared by a shorter key"
+            );
+
+            db.write(
+                BatchBuilder::new()
+                    .with_account_id(document_id)
+                    .with_collection(Collection::Email)
+                    .with_document(document_id)
+                    .clear(ValueClass::Property(ORPHAN_FIELD))
+                    .build_all(),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.write(
+            BatchBuilder::new()
+                .clear(ValueClass::Any(store::write::AnyClass {
+                    subspace: store::SUBSPACE_PROPERTY,
+                    key: vec![0u8],
+                }))
+                .build_all(),
+        )
+        .await
+        .unwrap();
+
+        db.delete_range(orphan_range(0), orphan_range(u32::MAX))
+            .await
+            .unwrap();
 
         if std::env::var("SLOW_FDB_TRX").is_ok() {
             println!("Running FoundationDB slow transaction tests...");

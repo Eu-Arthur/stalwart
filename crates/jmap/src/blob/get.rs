@@ -16,7 +16,7 @@ use jmap_proto::{
     request::{IntoValid, MaybeInvalid},
 };
 use jmap_tools::{Map, Value};
-use mail_builder::encoders::base64::base64_encode;
+use mail_builder::encoders::Base64Encoder;
 use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha512};
 use std::future::Future;
@@ -47,9 +47,8 @@ impl BlobOperations for Server {
         mut request: GetRequest<Blob>,
         access_token: &AccessToken,
     ) -> trc::Result<GetResponse<Blob>> {
-        let ids = request
-            .unwrap_ids(self.core.jmap.get_max_objects)?
-            .unwrap_or_default();
+        let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
+        let ids = ids.unwrap_or_default();
         let properties = request.unwrap_properties(&[
             BlobProperty::Id,
             BlobProperty::Data(DataProperty::Default),
@@ -59,7 +58,7 @@ impl BlobOperations for Server {
             account_id: request.account_id.into(),
             state: None,
             list: Vec::with_capacity(ids.len()),
-            not_found: vec![],
+            not_found: not_found_ids,
         };
 
         let range_from = request.arguments.offset.unwrap_or(0);
@@ -94,7 +93,9 @@ impl BlobOperations for Server {
                                 let mut hasher = Sha1::new();
                                 hasher.update(bytes_range);
                                 String::from_utf8(
-                                    base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
+                                    Base64Encoder::new()
+                                        .encode(&hasher.finalize()[..])
+                                        .unwrap_or_default(),
                                 )
                                 .unwrap()
                             }
@@ -102,7 +103,9 @@ impl BlobOperations for Server {
                                 let mut hasher = Sha256::new();
                                 hasher.update(bytes_range);
                                 String::from_utf8(
-                                    base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
+                                    Base64Encoder::new()
+                                        .encode(&hasher.finalize()[..])
+                                        .unwrap_or_default(),
                                 )
                                 .unwrap()
                             }
@@ -110,7 +113,9 @@ impl BlobOperations for Server {
                                 let mut hasher = Sha512::new();
                                 hasher.update(bytes_range);
                                 String::from_utf8(
-                                    base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
+                                    Base64Encoder::new()
+                                        .encode(&hasher.finalize()[..])
+                                        .unwrap_or_default(),
                                 )
                                 .unwrap()
                             }
@@ -124,11 +129,11 @@ impl BlobOperations for Server {
                                     Value::Null
                                 }
                             },
-                            DataProperty::AsBase64 => {
-                                String::from_utf8(base64_encode(bytes_range).unwrap_or_default())
-                                    .unwrap()
-                                    .into()
-                            }
+                            DataProperty::AsBase64 => String::from_utf8(
+                                Base64Encoder::new().encode(bytes_range).unwrap_or_default(),
+                            )
+                            .unwrap()
+                            .into(),
                             DataProperty::Default => match std::str::from_utf8(bytes_range) {
                                 Ok(text) => {
                                     property = BlobProperty::Data(DataProperty::AsText);
@@ -138,7 +143,9 @@ impl BlobOperations for Server {
                                     property = BlobProperty::Data(DataProperty::AsBase64);
                                     blob.insert_unchecked(BlobProperty::IsEncodingProblem, true);
                                     String::from_utf8(
-                                        base64_encode(bytes_range).unwrap_or_default(),
+                                        Base64Encoder::new()
+                                            .encode(bytes_range)
+                                            .unwrap_or_default(),
                                     )
                                     .unwrap()
                                     .into()
@@ -153,7 +160,7 @@ impl BlobOperations for Server {
                 // Add result to response
                 response.list.push(blob.into());
             } else {
-                response.not_found.push(blob_id);
+                response.push_not_found(blob_id);
             }
         }
 

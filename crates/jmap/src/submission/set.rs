@@ -21,13 +21,13 @@ use jmap_proto::{
     object::email_submission::{self, EmailSubmissionProperty, EmailSubmissionValue},
     references::resolve::ResolveCreatedReference,
     request::{
-        Call, IntoValid, MaybeInvalid, RequestMethod, SetRequestMethod,
+        Call, MaybeInvalid, RequestMethod, SetRequestMethod,
         method::{MethodFunction, MethodName, MethodObject},
         reference::{MaybeIdReference, MaybeResultReference},
     },
-    types::state::State,
+    types::{date::UTCDate, state::State},
 };
-use jmap_tools::{Key, Value};
+use jmap_tools::{Key, Map, Value};
 use smtp::{
     core::{Session, SessionData},
     queue::spool::SmtpSpool,
@@ -71,10 +71,11 @@ impl EmailSubmissionSet for Server {
     ) -> trc::Result<SetResponse<email_submission::EmailSubmission>> {
         let account_id = request.account_id.document_id();
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
-        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
+        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
 
         // Process creates
         let mut success_email_ids = HashMap::new();
+        let mut changed_email_ids = HashMap::new();
         let mut batch = BatchBuilder::new();
         for (id, object) in request.unwrap_create() {
             match self
@@ -87,6 +88,13 @@ impl EmailSubmissionSet for Server {
                         id.clone(),
                         Id::from_parts(submission.thread_id, submission.email_id),
                     );
+
+                    let send_at = submission.send_at;
+                    let undo_status = match submission.undo_status {
+                        UndoStatus::Pending => email_submission::UndoStatus::Pending,
+                        UndoStatus::Final => email_submission::UndoStatus::Final,
+                        UndoStatus::Canceled => email_submission::UndoStatus::Canceled,
+                    };
 
                     // Insert record
                     let document_id = self
@@ -101,7 +109,27 @@ impl EmailSubmissionSet for Server {
                         .custom(ObjectIndexBuilder::<(), _>::new().with_changes(submission))
                         .caused_by(trc::location!())?
                         .commit_point();
-                    response.created(id, document_id);
+
+                    response.created.insert(
+                        id,
+                        Value::Object(
+                            Map::with_capacity(3)
+                                .with_key_value(
+                                    EmailSubmissionProperty::Id,
+                                    Value::Element(Id::from(document_id).into()),
+                                )
+                                .with_key_value(
+                                    EmailSubmissionProperty::SendAt,
+                                    Value::Element(EmailSubmissionValue::Date(
+                                        UTCDate::from_timestamp(send_at as i64),
+                                    )),
+                                )
+                                .with_key_value(
+                                    EmailSubmissionProperty::UndoStatus,
+                                    Value::Element(EmailSubmissionValue::UndoStatus(undo_status)),
+                                ),
+                        ),
+                    );
                 }
                 Err(err) => {
                     response.not_created.append(id, err);
@@ -110,7 +138,14 @@ impl EmailSubmissionSet for Server {
         }
 
         // Process updates
-        'update: for (id, object) in request.unwrap_update().into_valid() {
+        'update: for (id, object) in request.unwrap_update() {
+            let id = match id {
+                MaybeInvalid::Value(id) => id,
+                invalid => {
+                    response.not_updated.append(invalid, SetError::not_found());
+                    continue 'update;
+                }
+            };
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -145,6 +180,19 @@ impl EmailSubmissionSet for Server {
                     continue 'update;
                 };
 
+                if matches!(&property, Key::Property(EmailSubmissionProperty::Id)) {
+                    if !crate::matches_id(&value, id) {
+                        response.not_updated.append(
+                            id,
+                            SetError::invalid_properties()
+                                .with_property(EmailSubmissionProperty::Id)
+                                .with_description("The id property is immutable."),
+                        );
+                        continue 'update;
+                    }
+                    continue;
+                }
+
                 if let (
                     Key::Property(EmailSubmissionProperty::UndoStatus),
                     Value::Element(EmailSubmissionValue::UndoStatus(undo_status_)),
@@ -175,6 +223,8 @@ impl EmailSubmissionSet for Server {
                         // Update record
                         let mut new_submission = submission.inner.clone();
                         new_submission.undo_status = UndoStatus::Canceled;
+                        let email_id =
+                            Id::from_parts(new_submission.thread_id, new_submission.email_id);
                         batch
                             .with_account_id(account_id)
                             .with_collection(Collection::EmailSubmission)
@@ -186,6 +236,7 @@ impl EmailSubmissionSet for Server {
                             )
                             .caused_by(trc::location!())?
                             .commit_point();
+                        changed_email_ids.insert(id, email_id);
                         response.updated.append(id, None);
                     } else {
                         response.not_updated.append(
@@ -227,19 +278,21 @@ impl EmailSubmissionSet for Server {
                 .await?
             {
                 // Update record
+                let submission = submission
+                    .to_unarchived::<EmailSubmission>()
+                    .caused_by(trc::location!())?;
+                let email_id = Id::from_parts(
+                    u32::from(submission.inner.thread_id),
+                    u32::from(submission.inner.email_id),
+                );
                 batch
                     .with_account_id(account_id)
                     .with_collection(Collection::EmailSubmission)
                     .with_document(document_id)
-                    .custom(
-                        ObjectIndexBuilder::<_, ()>::new().with_current(
-                            submission
-                                .to_unarchived::<EmailSubmission>()
-                                .caused_by(trc::location!())?,
-                        ),
-                    )
+                    .custom(ObjectIndexBuilder::<_, ()>::new().with_current(submission))
                     .caused_by(trc::location!())?
                     .commit_point();
+                changed_email_ids.insert(id, email_id);
                 response.destroyed.push(id);
             } else {
                 response.not_destroyed.append(id, SetError::not_found());
@@ -257,18 +310,34 @@ impl EmailSubmissionSet for Server {
         }
 
         // On success
-        if (request
+        let resolve_email_id = |id: MaybeIdReference<Id>| match id {
+            MaybeIdReference::Id(id) => changed_email_ids.get(&id).copied(),
+            MaybeIdReference::Reference(id_ref) => success_email_ids.get(&id_ref).copied(),
+            MaybeIdReference::Invalid(_) => None,
+        };
+        let update = request
+            .arguments
+            .on_success_update_email
+            .map(|update| {
+                update
+                    .into_iter()
+                    .filter_map(|(id, value)| {
+                        resolve_email_id(id).map(|id| (MaybeInvalid::Value(id), value))
+                    })
+                    .collect::<VecMap<_, _>>()
+            })
+            .filter(|update| !update.is_empty());
+        let destroy = request
             .arguments
             .on_success_destroy_email
-            .as_ref()
-            .is_some_and(|p| !p.is_empty())
-            || request
-                .arguments
-                .on_success_update_email
-                .as_ref()
-                .is_some_and(|p| !p.is_empty()))
-            && response.has_changes()
-        {
+            .map(|ids| {
+                ids.into_iter()
+                    .filter_map(resolve_email_id)
+                    .map(MaybeInvalid::Value)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ids| !ids.is_empty());
+        if update.is_some() || destroy.is_some() {
             *next_call = Call {
                 id: String::new(),
                 name: MethodName::new(MethodObject::Email, MethodFunction::Set),
@@ -276,38 +345,8 @@ impl EmailSubmissionSet for Server {
                     account_id: request.account_id,
                     if_in_state: None,
                     create: None,
-                    update: request.arguments.on_success_update_email.map(|update| {
-                        update
-                            .into_iter()
-                            .filter_map(|(id, value)| {
-                                (
-                                    match id {
-                                        MaybeIdReference::Id(id) => MaybeInvalid::Value(id),
-                                        MaybeIdReference::Reference(id_ref) => {
-                                            MaybeInvalid::Value(*(success_email_ids.get(&id_ref)?))
-                                        }
-                                        MaybeIdReference::Invalid(id) => MaybeInvalid::Invalid(id),
-                                    },
-                                    value,
-                                )
-                                    .into()
-                            })
-                            .collect()
-                    }),
-                    destroy: request.arguments.on_success_destroy_email.map(|ids| {
-                        MaybeResultReference::Value(
-                            ids.into_iter()
-                                .filter_map(|id| match id {
-                                    MaybeIdReference::Id(id) => Some(id),
-                                    MaybeIdReference::Reference(id_ref) => {
-                                        success_email_ids.get(&id_ref).copied()
-                                    }
-                                    MaybeIdReference::Invalid(_) => None,
-                                })
-                                .map(MaybeInvalid::Value)
-                                .collect(),
-                        )
-                    }),
+                    update,
+                    destroy: destroy.map(MaybeResultReference::Value),
                     arguments: Default::default(),
                 }))),
             }
@@ -682,7 +721,7 @@ impl EmailSubmissionSet for Server {
                 session.data.message = message;
                 let response = session.queue_message().await;
                 if let smtp::core::State::Accepted(queue_id) = session.state {
-                    Ok((true, responses, Some(queue_id)))
+                    Ok((responses, Some(queue_id)))
                 } else {
                     Err(
                         SetError::new(SetErrorType::ForbiddenToSend).with_description(format!(
@@ -692,22 +731,22 @@ impl EmailSubmissionSet for Server {
                     )
                 }
             } else {
-                Ok((false, responses, None))
+                Ok((responses, None))
             }
         });
 
         match handle.await {
-            Ok(Ok((has_success, responses, queue_id))) => {
+            Ok(Ok((responses, queue_id))) => {
                 // Set queue ID
                 if let Some(queue_id) = queue_id {
                     submission.queue_id = Some(queue_id);
                 }
 
                 // Set responses
-                submission.undo_status = if has_success {
-                    UndoStatus::Final
-                } else {
+                submission.undo_status = if submission.queue_id.is_some() {
                     UndoStatus::Pending
+                } else {
+                    UndoStatus::Final
                 };
                 submission.delivery_status = responses
                     .into_iter()

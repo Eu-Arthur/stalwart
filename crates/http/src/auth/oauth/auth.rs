@@ -5,12 +5,20 @@
  */
 
 use super::{DeviceAuthResponse, FormData, MAX_POST_LEN, OAuthCode, PkceCodeChallenge};
-use crate::auth::oauth::{OAuthStatus, openid::OpenIdHandler};
+use crate::auth::oauth::{
+    OAuthStatus, openid::OpenIdHandler, registration::ClientRegistrationHandler,
+};
 use common::{
     KV_OAUTH, Server,
     auth::{
         AuthRequest,
-        oauth::{CLIENT_ID_MAX_LEN, DEVICE_CODE_LEN, USER_CODE_ALPHABET, USER_CODE_LEN},
+        authentication::UsernameParts,
+        oauth::{
+            CLIENT_ID_MAX_LEN, DEVICE_CODE_LEN, SUPPORTED_SCOPES, USER_CODE_ALPHABET,
+            USER_CODE_LEN,
+            client_id::{decode_client_id, scopes_to_mask},
+            registration::redirect_uri_matches,
+        },
     },
 };
 use directory::Credentials;
@@ -23,14 +31,21 @@ use store::{
 };
 use store::{
     rand::{
-        Rng,
+        RngExt,
         distr::{Alphanumeric, StandardUniform},
         rng,
     },
     write::AlignedBytes,
 };
 use trc::AddContext;
-use utils::DomainPart;
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProtectedResourceMetadata {
+    pub resource: String,
+    pub authorization_servers: [String; 1],
+    pub scopes_supported: &'static [&'static str],
+    pub bearer_methods_supported: &'static [&'static str],
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct OAuthMetadata {
@@ -43,7 +58,9 @@ pub struct OAuthMetadata {
     pub grant_types_supported: &'static [&'static str],
     pub response_types_supported: &'static [&'static str],
     pub scopes_supported: &'static [&'static str],
+    pub token_endpoint_auth_methods_supported: &'static [&'static str],
     pub code_challenge_methods_supported: &'static [&'static str],
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 pub trait OAuthApiHandler: Sync + Send {
@@ -66,6 +83,10 @@ pub trait OAuthApiHandler: Sync + Send {
     ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
 
     fn handle_oauth_metadata(&self) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+
+    fn handle_oauth_protected_resource(
+        &self,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -92,6 +113,8 @@ pub enum LoginRequest {
         code_challenge_method: Option<String>,
         #[serde(default)]
         state: Option<String>,
+        #[serde(default)]
+        resource: Vec<String>,
     },
     #[serde(rename_all = "camelCase")]
     AuthDevice {
@@ -108,7 +131,7 @@ pub enum LoginRequest {
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
 pub enum LoginResponse {
-    Authenticated { client_code: String },
+    Authenticated { client_code: String, iss: String },
     Verified,
     MfaRequired,
     Failure,
@@ -120,8 +143,15 @@ impl OAuthApiHandler for Server {
         session: &HttpSessionData,
         account_name: &str,
     ) -> trc::Result<HttpResponse> {
-        let account_name = account_name.trim().to_lowercase();
-        if let Some(domain_name) = account_name.try_domain_part()
+        let username = UsernameParts::new(account_name.trim());
+        let auth_as = username.auth_as();
+        let is_recovery_admin = self
+            .registry()
+            .recovery_admin()
+            .is_some_and(|(user, _)| user.trim().eq_ignore_ascii_case(auth_as.address()));
+
+        if !is_recovery_admin
+            && let Some(domain_name) = auth_as.domain().filter(|domain| !domain.is_empty())
             && let Some(endpoint) = self
                 .get_directory_for_domain(domain_name)
                 .await?
@@ -152,8 +182,10 @@ impl OAuthApiHandler for Server {
                 client_id,
                 redirect_uri,
                 nonce,
+                scope,
                 code_challenge,
                 code_challenge_method,
+                resource,
                 ..
             } => {
                 // Validate clientId
@@ -173,21 +205,81 @@ impl OAuthApiHandler for Server {
                     }
                 }
 
+                // Resolve the client and validate the redirect URI against the registration.
+                // Stateless client ids are self-describing; otherwise fall back to the registry.
+                let redirect_uri = redirect_uri.ok_or_else(|| {
+                    trc::AuthEvent::Error
+                        .into_err()
+                        .details("A redirect URI is required.")
+                })?;
+                let stateless_client =
+                    decode_client_id(self.core.oauth.oauth_key.as_bytes(), &client_id);
+                let granted_scope = match &stateless_client {
+                    Some(meta) => {
+                        if !meta
+                            .redirect_uris
+                            .iter()
+                            .any(|uri| redirect_uri_matches(uri, &redirect_uri))
+                        {
+                            return Err(trc::AuthEvent::Error
+                                .into_err()
+                                .details("Redirect URI does not match the client registration."));
+                        }
+                        grant_scope(scope.as_deref(), meta.scope_mask)
+                    }
+                    None => scope,
+                };
+
+                // Validate Resource Indicators (RFC 8707)
+                for resource in &resource {
+                    if !is_known_resource(
+                        [self.core.network.server_name.as_str()]
+                            .into_iter()
+                            .chain(
+                                self.core
+                                    .network
+                                    .info
+                                    .services
+                                    .values()
+                                    .filter_map(|v| v.hostname.as_deref()),
+                            )
+                            .chain(
+                                self.core
+                                    .network
+                                    .info
+                                    .mxs
+                                    .iter()
+                                    .filter_map(|mx| mx.hostname.as_deref()),
+                            ),
+                        resource,
+                    ) {
+                        return Err(trc::AuthEvent::Error
+                            .into_err()
+                            .details(format!("Unknown resource indicator: {}", resource)));
+                    }
+                }
+
                 // Parse and validate PKCE challenge (RFC 7636).
                 let pkce_challenge = match code_challenge {
-                    Some(challenge) => {
-                        // Default to "plain" when the method is omitted, per RFC 7636 4.3.
-                        match code_challenge_method.as_deref().unwrap_or("plain") {
-                            "S256" => PkceCodeChallenge::S256(challenge),
-                            "plain" => PkceCodeChallenge::Plain(challenge),
-                            _ => {
-                                return Err(trc::AuthEvent::Error
-                                    .into_err()
-                                    .details("Unsupported PKCE code_challenge_method."));
-                            }
+                    Some(challenge) => match code_challenge_method.as_deref().unwrap_or("plain") {
+                        "S256" => PkceCodeChallenge::S256(challenge),
+                        "plain" if stateless_client.is_none() => {
+                            PkceCodeChallenge::Plain(challenge)
                         }
+                        _ => {
+                            return Err(trc::AuthEvent::Error
+                                .into_err()
+                                .details("Unsupported PKCE code_challenge_method."));
+                        }
+                    },
+                    None => {
+                        if stateless_client.is_some() {
+                            return Err(trc::AuthEvent::Error.into_err().details(
+                                "A PKCE code_challenge with the S256 method is required.",
+                            ));
+                        }
+                        PkceCodeChallenge::None
                     }
-                    None => PkceCodeChallenge::None,
                 };
 
                 // Authenticate
@@ -204,6 +296,22 @@ impl OAuthApiHandler for Server {
                     .await
                 {
                     Ok(access_token) => {
+                        // Registry-backed clients are validated once the account is known
+                        if stateless_client.is_none()
+                            && self
+                                .validate_client_registration(
+                                    &client_id,
+                                    Some(redirect_uri.as_str()),
+                                    access_token.account_id(),
+                                )
+                                .await?
+                                .is_some()
+                        {
+                            return Err(trc::AuthEvent::Error
+                                .into_err()
+                                .details("Invalid client registration."));
+                        }
+
                         // Generate client code
                         let client_code = rng()
                             .sample_iter(Alphanumeric)
@@ -217,8 +325,10 @@ impl OAuthApiHandler for Server {
                             account_id: access_token.account_id(),
                             client_id,
                             nonce,
-                            params: redirect_uri.unwrap_or_default(),
+                            params: redirect_uri,
                             code_challenge: pkce_challenge,
+                            scope: granted_scope,
+                            resources: resource,
                         })
                         .untrusted()
                         .serialize()
@@ -232,7 +342,10 @@ impl OAuthApiHandler for Server {
                             )
                             .await?;
 
-                        LoginResponse::Authenticated { client_code }
+                        LoginResponse::Authenticated {
+                            client_code,
+                            iss: self.core.network.http.url_https.clone(),
+                        }
                     }
                     Err(err) => match *err.as_ref() {
                         trc::EventType::Auth(trc::AuthEvent::MfaRequired) => {
@@ -294,6 +407,12 @@ impl OAuthApiHandler for Server {
                                     nonce: oauth.nonce.as_ref().map(|s| s.to_string()),
                                     params: Default::default(),
                                     code_challenge: PkceCodeChallenge::None,
+                                    scope: oauth.scope.as_ref().map(|s| s.to_string()),
+                                    resources: oauth
+                                        .resources
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect(),
                                 };
 
                                 // Delete issued user code
@@ -365,6 +484,9 @@ impl OAuthApiHandler for Server {
                     .details("Client ID is missing.")
             })?;
         let nonce = form_data.remove("nonce");
+        let scope = form_data
+            .remove("scope")
+            .and_then(|scope| grant_scope(Some(&scope), u64::MAX));
 
         // Generate device code
         let device_code = rng()
@@ -395,6 +517,8 @@ impl OAuthApiHandler for Server {
             nonce,
             params: device_code.clone(),
             code_challenge: PkceCodeChallenge::None,
+            scope,
+            resources: Vec::new(),
         })
         .untrusted()
         .serialize()
@@ -441,22 +565,85 @@ impl OAuthApiHandler for Server {
             registration_endpoint: format!("{base_url}/auth/register"),
             grant_types_supported: &[
                 "authorization_code",
-                "implicit",
+                "refresh_token",
                 "urn:ietf:params:oauth:grant-type:device_code",
             ],
-            response_types_supported: &["code", "id_token", "code token", "id_token token"],
-            scopes_supported: &[
-                "openid",
-                "offline_access",
-                "urn:ietf:params:jmap:core",
-                "urn:ietf:params:jmap:mail",
-                "urn:ietf:params:jmap:submission",
-                "urn:ietf:params:jmap:vacationresponse",
+            response_types_supported: &["code"],
+            scopes_supported: SUPPORTED_SCOPES,
+            token_endpoint_auth_methods_supported: &[
+                "none",
+                "client_secret_post",
+                "client_secret_basic",
             ],
             code_challenge_methods_supported: &["S256"],
+            authorization_response_iss_parameter_supported: true,
             issuer: base_url.to_string(),
         })
         .into_http_response()
         .with_cors_unrestricted())
     }
+
+    async fn handle_oauth_protected_resource(&self) -> trc::Result<HttpResponse> {
+        let base_url = &self.core.network.http.url_https;
+
+        Ok(JsonResponse::new(ProtectedResourceMetadata {
+            resource: base_url.to_string(),
+            authorization_servers: [base_url.to_string()],
+            scopes_supported: SUPPORTED_SCOPES,
+            bearer_methods_supported: &["header"],
+        })
+        .into_http_response()
+        .with_cors_unrestricted())
+    }
+}
+
+fn grant_scope(requested: Option<&str>, registered_mask: u64) -> Option<String> {
+    let mut granted = String::new();
+    for scope in requested.unwrap_or_default().split_ascii_whitespace() {
+        let bit = scopes_to_mask(scope);
+        if bit != 0 && registered_mask & bit == bit {
+            if !granted.is_empty() {
+                granted.push(' ');
+            }
+            granted.push_str(scope);
+        }
+    }
+
+    (!granted.is_empty()).then_some(granted)
+}
+
+fn is_known_resource<'x>(hostnames: impl IntoIterator<Item = &'x str>, uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let supported = hashify::tiny_map!(scheme.as_bytes(),
+        b"http" => true,
+        b"https" => true,
+        b"smtp" => true,
+        b"smtps" => true,
+        b"imap" => true,
+        b"imaps" => true,
+        b"pop3" => true,
+        b"pop3s" => true,
+        b"caldav" => true,
+        b"caldavs" => true,
+        b"webdav" => true,
+        b"webdavs" => true,
+        b"carddav" => true,
+        b"carddavs" => true,
+        b"sieve" => true,
+        b"sieves" => true
+    )
+    .unwrap_or(false);
+
+    let authority = rest.split_once('/').map_or(rest, |(auth, _)| auth);
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.as_bytes().iter().all(|c| c.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host);
+
+    supported
+        && hostnames
+            .into_iter()
+            .any(|hostname| host.eq_ignore_ascii_case(hostname))
 }

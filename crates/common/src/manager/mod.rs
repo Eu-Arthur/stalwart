@@ -19,6 +19,8 @@ pub mod boot;
 pub mod console;
 pub mod defaults;
 pub mod restore;
+#[cfg(target_os = "linux")]
+pub mod systemd;
 
 pub const SPAM_TRAINER_KEY: &[u8] = "STALWART_SPAM_TRAIN_DATA.lz4".as_bytes();
 pub const SPAM_CLASSIFIER_KEY: &[u8] = "STALWART_SPAM_CLASSIFIER_MODEL.lz4".as_bytes();
@@ -34,9 +36,8 @@ pub async fn fetch_resource(
             .await
             .map_err(|err| format!("Failed to read {path}: {err}"))
     } else {
-        let response = reqwest::Client::builder()
+        let response = utils::http::http_client_builder(is_localhost_url(url))
             .timeout(timeout)
-            .danger_accept_invalid_certs(is_localhost_url(url))
             .user_agent(USER_AGENT)
             .build()
             .unwrap_or_default()

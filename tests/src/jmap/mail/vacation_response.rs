@@ -11,6 +11,7 @@ use crate::{
     utils::{dns::DnsCache, server::TestServer, smtp::SmtpConnection},
 };
 use chrono::{TimeDelta, Utc};
+use jmap_client::core::response::VacationResponseSetResponse;
 use std::time::Instant;
 
 pub async fn test(test: &TestServer) {
@@ -29,9 +30,45 @@ pub async fn test(test: &TestServer) {
         Instant::now() + std::time::Duration::from_secs(10),
     );
 
+    // Enabling with only isEnabled on a fresh account uses the default response
+    let mut request = client.build();
+    request
+        .set_vacation_response()
+        .update("singleton")
+        .is_enabled(true);
+    request
+        .send_single::<VacationResponseSetResponse>()
+        .await
+        .unwrap()
+        .updated("singleton")
+        .unwrap();
+    let mut lmtp = SmtpConnection::connect().await;
+    lmtp.ingest(
+        "michael@remote.org",
+        &["jdoe@example.com"],
+        concat!(
+            "From: michael@remote.org\r\n",
+            "To: jdoe@example.com\r\n",
+            "Subject: Printer\r\n",
+            "\r\n",
+            "PC load letter? What does that even mean?",
+        ),
+    )
+    .await;
+    lmtp.quit().await;
+    assert_message_delivery(
+        &mut smtp_rx,
+        MockMessage::new(
+            "<jdoe@example.com>",
+            ["<michael@remote.org>"],
+            "@I am away.",
+        ),
+    )
+    .await;
+
     // Let people know that we'll be down in Kokomo
     client
-        .vacation_response_create(
+        .vacation_response_enable(
             "Off the Florida Keys there's a place called Kokomo",
             "That's where you wanna go to get away from it all".into(),
             "That's where <b>you wanna go</b> to get away from it all".into(),
@@ -154,7 +191,13 @@ pub async fn test(test: &TestServer) {
     .await;
 
     // Remove test data
-    client.vacation_response_destroy().await.unwrap();
+    client.vacation_response_disable().await.unwrap();
+    client.sieve_script_deactivate().await.unwrap();
+    let mut request = client.build();
+    request.query_sieve_script();
+    for id in request.send_query_sieve_script().await.unwrap().take_ids() {
+        client.sieve_script_destroy(&id).await.unwrap();
+    }
     test.destroy_all_mailboxes(account).await;
     test.assert_is_empty().await;
 }

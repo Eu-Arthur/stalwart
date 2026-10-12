@@ -5,6 +5,7 @@
  */
 
 use crate::api::acl::{JmapAcl, JmapRights};
+use crate::changes::state::JmapCacheState;
 use calcard::jscalendar::{JSCalendarAlertAction, JSCalendarRelativeTo, JSCalendarType};
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
 use groupware::{
@@ -21,11 +22,11 @@ use jmap_proto::{
     error::set::SetError,
     method::set::{SetRequest, SetResponse},
     object::calendar::{self, CalendarProperty, CalendarValue, IncludeInAvailability},
-    request::{IntoValid, reference::MaybeIdReference},
+    request::{MaybeInvalid, reference::MaybeIdReference},
     types::state::State,
 };
 use jmap_tools::{JsonPointerItem, Key, Map, Value};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use store::{
     SerializeInfallible, ValueKey,
     ahash::AHashSet,
@@ -36,6 +37,7 @@ use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
     field::PrincipalField,
+    id::Id,
 };
 
 pub trait CalendarSet: Sync + Send {
@@ -62,8 +64,9 @@ impl CalendarSet for Server {
                 SyncCollection::Calendar,
             )
             .await?;
-        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
-        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
+        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?
+            .with_state(cache.assert_state(true, &request.if_in_state)?);
+        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
         let is_shared = access_token.is_shared(account_id);
         let mut set_default = None;
 
@@ -94,7 +97,8 @@ impl CalendarSet for Server {
             };
 
             // Process changes
-            if let Err(err) = update_calendar(object, &mut calendar, access_token) {
+            if let Err(err) = update_calendar(None, object, &mut calendar, access_token, account_id)
+            {
                 response.not_created.append(id, err);
                 continue 'create;
             }
@@ -137,7 +141,14 @@ impl CalendarSet for Server {
         }
 
         // Process updates
-        'update: for (id, object) in request.unwrap_update().into_valid() {
+        'update: for (id, object) in request.unwrap_update() {
+            let id = match id {
+                MaybeInvalid::Value(id) => id,
+                invalid => {
+                    response.not_updated.append(invalid, SetError::not_found());
+                    continue 'update;
+                }
+            };
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -168,7 +179,13 @@ impl CalendarSet for Server {
                 .caused_by(trc::location!())?;
 
             // Apply changes
-            let has_acl_changes = match update_calendar(object, &mut new_calendar, access_token) {
+            let has_acl_changes = match update_calendar(
+                Some(id),
+                object,
+                &mut new_calendar,
+                access_token,
+                account_id,
+            ) {
                 Ok(has_acl_changes_) => has_acl_changes_,
                 Err(err) => {
                     response.not_updated.append(id, err);
@@ -282,12 +299,15 @@ impl CalendarSet for Server {
                 destroy_parents.insert(document_id);
 
                 // Delete record
+                let delete_path = cache
+                    .container_resource_path_by_id(document_id)
+                    .map(|resource| cache.format_resource(resource));
                 DestroyArchive(calendar)
                     .delete(
                         access_token.account_tenant_ids(),
                         account_id,
                         document_id,
-                        None,
+                        delete_path,
                         &mut batch,
                     )
                     .caused_by(trc::location!())?;
@@ -397,10 +417,13 @@ impl CalendarSet for Server {
 }
 
 fn update_calendar(
+    expected_id: Option<Id>,
     updates: Value<'_, CalendarProperty, CalendarValue>,
     calendar: &mut Calendar,
     access_token: &AccessToken,
+    account_id: u32,
 ) -> Result<bool, SetError<CalendarProperty>> {
+    let personal_id = access_token.personal_id(account_id, Collection::Calendar);
     let mut has_acl_changes = false;
 
     for (property, value) in updates.into_expanded_object() {
@@ -412,48 +435,48 @@ fn update_calendar(
 
         match (property, value) {
             (CalendarProperty::Name, Value::Str(value)) if (1..=255).contains(&value.len()) => {
-                calendar.preferences_mut(access_token).name = value.into_owned();
+                calendar.preferences_mut(personal_id).name = value.into_owned();
             }
             (CalendarProperty::Description, Value::Str(value)) if value.len() < 255 => {
-                calendar.preferences_mut(access_token).description = value.into_owned().into();
+                calendar.preferences_mut(personal_id).description = value.into_owned().into();
             }
             (CalendarProperty::Description, Value::Null) => {
-                calendar.preferences_mut(access_token).description = None;
+                calendar.preferences_mut(personal_id).description = None;
             }
             (CalendarProperty::Color, Value::Str(value)) if value.len() < 16 => {
-                calendar.preferences_mut(access_token).color = value.into_owned().into();
+                calendar.preferences_mut(personal_id).color = value.into_owned().into();
             }
             (CalendarProperty::Color, Value::Null) => {
-                calendar.preferences_mut(access_token).color = None;
+                calendar.preferences_mut(personal_id).color = None;
             }
             (CalendarProperty::TimeZone, Value::Element(CalendarValue::Timezone(tz))) => {
-                calendar.preferences_mut(access_token).time_zone = Timezone::IANA(tz.as_id());
+                calendar.preferences_mut(personal_id).time_zone = Timezone::IANA(tz.as_id());
             }
             (CalendarProperty::TimeZone, Value::Null) => {
-                calendar.preferences_mut(access_token).time_zone = Timezone::Default;
+                calendar.preferences_mut(personal_id).time_zone = Timezone::Default;
             }
             (CalendarProperty::SortOrder, Value::Number(value)) => {
-                calendar.preferences_mut(access_token).sort_order = value.cast_to_u64() as u32;
+                calendar.preferences_mut(personal_id).sort_order = value.cast_to_u64() as u32;
             }
             (CalendarProperty::IsSubscribed, Value::Bool(subscribe)) => {
                 if subscribe {
-                    calendar.preferences_mut(access_token).flags |= CALENDAR_SUBSCRIBED;
+                    calendar.preferences_mut(personal_id).flags |= CALENDAR_SUBSCRIBED;
                 } else {
-                    calendar.preferences_mut(access_token).flags &= !CALENDAR_SUBSCRIBED;
+                    calendar.preferences_mut(personal_id).flags &= !CALENDAR_SUBSCRIBED;
                 }
             }
             (CalendarProperty::IsVisible, Value::Bool(visible)) => {
                 if visible {
-                    calendar.preferences_mut(access_token).flags &= !CALENDAR_INVISIBLE;
+                    calendar.preferences_mut(personal_id).flags &= !CALENDAR_INVISIBLE;
                 } else {
-                    calendar.preferences_mut(access_token).flags |= CALENDAR_INVISIBLE;
+                    calendar.preferences_mut(personal_id).flags |= CALENDAR_INVISIBLE;
                 }
             }
             (
                 CalendarProperty::IncludeInAvailability,
                 Value::Element(CalendarValue::IncludeInAvailability(availability)),
             ) => {
-                let flags = &mut calendar.preferences_mut(access_token).flags;
+                let flags = &mut calendar.preferences_mut(personal_id).flags;
 
                 match availability {
                     IncludeInAvailability::All => {
@@ -476,7 +499,7 @@ fn update_calendar(
                 Value::Object(value),
             ) => {
                 let with_time = matches!(property, CalendarProperty::DefaultAlertsWithTime);
-                let alerts = &mut calendar.preferences_mut(access_token).default_alerts;
+                let alerts = &mut calendar.preferences_mut(personal_id).default_alerts;
 
                 alerts.retain(|alert| (alert.flags & ALERT_WITH_TIME != 0) != with_time);
 
@@ -521,7 +544,7 @@ fn update_calendar(
                             };
                             let with_time =
                                 matches!(property, CalendarProperty::DefaultAlertsWithTime);
-                            let alerts = &mut calendar.preferences_mut(access_token).default_alerts;
+                            let alerts = &mut calendar.preferences_mut(personal_id).default_alerts;
                             alerts.retain(|alert| {
                                 (alert.flags & ALERT_WITH_TIME != 0) != with_time || alert.id != id
                             });
@@ -543,6 +566,13 @@ fn update_calendar(
                     }
                 }
             }
+            (CalendarProperty::Id, value) => {
+                if !expected_id.is_some_and(|expected| crate::matches_id(&value, expected)) {
+                    return Err(SetError::invalid_properties()
+                        .with_property(CalendarProperty::Id)
+                        .with_description("The id property is immutable."));
+                }
+            }
             (property, _) => {
                 return Err(SetError::invalid_properties()
                     .with_property(property)
@@ -552,7 +582,7 @@ fn update_calendar(
     }
 
     // Validate name
-    if calendar.preferences(access_token).name.is_empty() {
+    if calendar.preferences(personal_id).name.is_empty() {
         return Err(SetError::invalid_properties()
             .with_property(CalendarProperty::Name)
             .with_description("Missing name."));

@@ -27,14 +27,13 @@ use x509_parser::prelude::{GeneralName, ParsedExtension};
 const HOSTNAMES: &[&str] = &["mta-sts", "ua-auto-config", "autoconfig", "autodiscover"];
 
 impl AcmeRequestBuilder {
-    pub async fn renew(
+    pub fn build_domains(
         &self,
         server: &Server,
         domain: &str,
         hostnames: &[String],
-        dns_parameters: Option<AcmeDnsParameters>,
-    ) -> AcmeResult<PemCert> {
-        let domains = if hostnames.is_empty() {
+    ) -> Vec<String> {
+        if hostnames.is_empty() {
             if matches!(
                 self.challenge,
                 ChallengeType::Dns01 | ChallengeType::DnsPersist01
@@ -43,8 +42,7 @@ impl AcmeRequestBuilder {
             } else {
                 let server_name = server.core.network.server_name.as_str();
                 let domain_suffix = format!(".{domain}");
-                let matches_zone =
-                    |name: &str| name == domain || name.ends_with(&domain_suffix);
+                let matches_zone = |name: &str| name == domain || name.ends_with(&domain_suffix);
 
                 // Add technical domains
                 let mut domains = HOSTNAMES
@@ -88,38 +86,91 @@ impl AcmeRequestBuilder {
                     }
                 })
                 .collect()
-        };
+        }
+    }
 
-        let mut params = CertificateParams::new(domains.clone()).map_err(|err| {
+    pub async fn renew(
+        &self,
+        server: &Server,
+        domains: Vec<String>,
+        reuse_key_pem: Option<String>,
+        dns_parameters: Option<AcmeDnsParameters>,
+    ) -> AcmeResult<PemCert> {
+        let mut published = BTreeSet::new();
+        let result = self
+            .run_order(
+                server,
+                &domains,
+                reuse_key_pem,
+                dns_parameters.as_ref(),
+                &mut published,
+            )
+            .await;
+
+        if let Some(dns_parameters) = &dns_parameters {
+            for (zone, challenge_name) in published {
+                let _ = dns_parameters
+                    .updater
+                    .delete_rrset(&zone, &challenge_name, dns_update::DnsRecordType::TXT)
+                    .await;
+            }
+        }
+
+        result
+    }
+
+    async fn run_order(
+        &self,
+        server: &Server,
+        domains: &[String],
+        reuse_key_pem: Option<String>,
+        dns_parameters: Option<&AcmeDnsParameters>,
+        published: &mut BTreeSet<(String, String)>,
+    ) -> AcmeResult<PemCert> {
+        let mut params = CertificateParams::new(domains.to_vec()).map_err(|err| {
             AcmeError::Crypto(format!("Failed to create certificate params: {}", err))
         })?;
         params.distinguished_name = DistinguishedName::new();
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-            .map_err(|err| AcmeError::Crypto(format!("Failed to generate key pair: {}", err)))?;
-        let response = self.new_order(domains.clone()).await?;
+        let key_pair = match reuse_key_pem {
+            Some(pem) => KeyPair::from_pem(&pem).map_err(|err| {
+                AcmeError::Crypto(format!("Failed to load private key for reuse: {}", err))
+            })?,
+            None => KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|err| {
+                AcmeError::Crypto(format!("Failed to generate key pair: {}", err))
+            })?,
+        };
+        let response = self.new_order(domains.to_vec()).await?;
         let order_url = response.location;
         let mut order = response.body;
         let mut retry_after = None;
+
+        trc::event!(
+            Acme(AcmeEvent::OrderStart),
+            Url = self.directory.new_order.to_string(),
+            Details = order_url.to_string(),
+            Hostname = domains,
+            Type = self.challenge.as_str(),
+        );
 
         loop {
             match order.status {
                 OrderStatus::Pending => {
                     if matches!(self.challenge, ChallengeType::Dns01) {
                         for url in &order.authorizations {
-                            self.authorize(server, url, dns_parameters.as_ref())
+                            self.authorize(server, url, dns_parameters, Some(published))
                                 .await?;
                         }
                     } else {
                         let auth_futures = order
                             .authorizations
                             .iter()
-                            .map(|url| self.authorize(server, url, dns_parameters.as_ref()));
+                            .map(|url| self.authorize(server, url, dns_parameters, None));
                         try_join_all(auth_futures).await?;
                     }
                     trc::event!(
                         Acme(AcmeEvent::AuthCompleted),
                         Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Hostname = domains,
                     );
                     let response = self.order(&order_url).await?;
                     order = response.body;
@@ -130,7 +181,7 @@ impl AcmeRequestBuilder {
                         trc::event!(
                             Acme(AcmeEvent::OrderProcessing),
                             Url = self.directory.new_order.to_string(),
-                            Hostname = domains.as_slice(),
+                            Hostname = domains,
                             Total = i,
                         );
 
@@ -158,7 +209,7 @@ impl AcmeRequestBuilder {
                     trc::event!(
                         Acme(AcmeEvent::OrderReady),
                         Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Hostname = domains,
                     );
 
                     let csr = params.serialize_request(&key_pair).map_err(|err| {
@@ -171,10 +222,10 @@ impl AcmeRequestBuilder {
                     trc::event!(
                         Acme(AcmeEvent::OrderValid),
                         Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Hostname = domains,
                     );
 
-                    let certificate = self.certificate(certificate).await?;
+                    let certificate = self.select_certificate(domains, certificate).await?;
 
                     return Ok(PemCert {
                         certificate,
@@ -188,6 +239,14 @@ impl AcmeRequestBuilder {
                         "Unknown reason".to_string()
                     };
 
+                    trc::event!(
+                        Acme(AcmeEvent::OrderInvalid),
+                        Url = self.directory.new_order.to_string(),
+                        Details = order_url.to_string(),
+                        Hostname = domains,
+                        Reason = reason.clone(),
+                    );
+
                     return Err(AcmeError::OrderInvalid(reason));
                 }
             }
@@ -199,6 +258,7 @@ impl AcmeRequestBuilder {
         server: &Server,
         url: &String,
         dns_parameters: Option<&AcmeDnsParameters>,
+        published: Option<&mut BTreeSet<(String, String)>>,
     ) -> AcmeResult<()> {
         let response = self
             .auth(url)
@@ -260,7 +320,12 @@ impl AcmeRequestBuilder {
                             .await?;
                     }
                     ChallengeType::Dns01 => {
-                        let dns_parameters = dns_parameters.unwrap();
+                        let Some(dns_parameters) = dns_parameters else {
+                            return Err(AcmeError::Invalid(
+                                "DNS-01 challenge requested but a DNS provider was not configured"
+                                    .to_string(),
+                            ));
+                        };
                         let domain = domain.strip_prefix("*.").unwrap_or(&domain);
 
                         let zone = dns_parameters
@@ -269,17 +334,27 @@ impl AcmeRequestBuilder {
                             .or_else(|| psl::domain_str(domain))
                             .unwrap_or(domain);
 
+                        let proof = self.dns_proof(challenge)?;
+                        let challenge_name = format!("_acme-challenge.{}", domain);
                         dns_parameters
                             .updater
-                            .create(
+                            .set_rrset(
                                 zone,
-                                &format!("_acme-challenge.{}", domain),
-                                DnsRecord::TXT(self.dns_proof(challenge)?),
-                                true,
-                                true,
+                                &challenge_name,
+                                dns_update::DnsRecordType::TXT,
+                                vec![DnsRecord::TXT(proof.clone())],
                             )
                             .await
                             .map_err(AcmeError::Dns)?;
+
+                        if let Some(published) = published {
+                            published.insert((zone.to_string(), challenge_name.clone()));
+                        }
+
+                        dns_parameters
+                            .updater
+                            .wait_for_txt_propagation(&challenge_name, zone, &proof)
+                            .await;
                     }
                     ChallengeType::DnsPersist01 => {}
                     ChallengeType::Unknown => unreachable!(),
@@ -290,7 +365,16 @@ impl AcmeRequestBuilder {
             }
             AuthStatus::Valid => return Ok(()),
             _ => {
-                return Err(AcmeError::AuthInvalid(auth.into_error()));
+                trc::event!(
+                    Acme(AcmeEvent::AuthError),
+                    Hostname = auth.identifier.hostname().to_string(),
+                    Type = self.challenge.as_str(),
+                    Url = self.directory.new_order.to_string(),
+                    Details = url.to_string(),
+                    Reason = auth.to_error(),
+                );
+
+                return Err(AcmeError::AuthInvalid(auth.to_error()));
             }
         };
 
@@ -323,91 +407,204 @@ impl AcmeRequestBuilder {
                     return Ok(());
                 }
                 _ => {
-                    return Err(AcmeError::AuthInvalid(response.body.into_error()));
+                    trc::event!(
+                        Acme(AcmeEvent::AuthError),
+                        Hostname = domain.to_string(),
+                        Type = self.challenge.as_str(),
+                        Url = self.directory.new_order.to_string(),
+                        Details = url.to_string(),
+                        Reason = response.body.to_error(),
+                    );
+
+                    return Err(AcmeError::AuthInvalid(response.body.to_error()));
                 }
             }
         }
+
+        trc::event!(
+            Acme(AcmeEvent::AuthTooManyAttempts),
+            Hostname = domain.to_string(),
+            Type = self.challenge.as_str(),
+            Url = self.directory.new_order.to_string(),
+            Details = url.to_string(),
+            Total = 5u64,
+        );
 
         Err(AcmeError::AuthTimeout {
             max_retries: self.max_retries,
         })
     }
+
+    async fn select_certificate(&self, domains: &[String], url: String) -> AcmeResult<String> {
+        let response = self.certificate(url).await?;
+        let Some(preferred) = self.preferred_chain.as_deref() else {
+            return Ok(response.body);
+        };
+
+        if chain_matches(&response.body, preferred) {
+            return Ok(response.body);
+        }
+
+        for alternate in &response.alternates {
+            match self.certificate(alternate).await {
+                Ok(alternate) if chain_matches(&alternate.body, preferred) => {
+                    return Ok(alternate.body);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    trc::event!(
+                        Acme(AcmeEvent::ProcessCert),
+                        Url = alternate.to_string(),
+                        Hostname = domains,
+                        Reason = err.to_string(),
+                    );
+                }
+            }
+        }
+
+        trc::event!(
+            Acme(AcmeEvent::ProcessCert),
+            Hostname = domains,
+            Reason = format!(
+                "Preferred certificate chain '{preferred}' not offered by the CA; using the default chain",
+            ),
+        );
+
+        Ok(response.body)
+    }
+}
+
+fn chain_matches(pem_chain: &str, preferred: &str) -> bool {
+    let Ok(blocks) = pem::parse_many(pem_chain) else {
+        return false;
+    };
+    let Some(top) = blocks.last() else {
+        return false;
+    };
+    let Ok((_, cert)) = parse_x509_certificate(top.contents()) else {
+        return false;
+    };
+    cert.issuer()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok())
+        .any(|cn| cn == preferred)
 }
 
 impl ParsedCert {
     pub fn parse(certificate: impl AsRef<[u8]>) -> AcmeResult<ParsedCert> {
-        pem::parse_many(certificate)
-            .map_err(|err| AcmeError::Crypto(format!("Failed to parse PEM: {}", err)))
-            .and_then(|pems| {
-                pems.into_iter()
-                    .next()
-                    .ok_or_else(|| AcmeError::Crypto("No certificates found in PEM".to_string()))
-            })
-            .and_then(|der| {
-                parse_x509_certificate(der.contents())
-                    .map_err(|err| {
-                        AcmeError::Crypto(format!("Failed to parse X.509 certificate: {}", err))
-                    })
-                    .and_then(|(_, cert)| {
-                        // Add CNs and SANs to the list of names
-                        let mut names: BTreeSet<String> = BTreeSet::new();
-                        for name in cert.subject().iter_common_name() {
-                            if let Ok(name) = name.as_str() {
-                                names.insert(name.into());
-                            }
-                        }
-                        for ext in cert.extensions() {
-                            if let ParsedExtension::SubjectAlternativeName(san) =
-                                ext.parsed_extension()
-                            {
-                                for name in &san.general_names {
-                                    let name = match name {
-                                        GeneralName::DNSName(name) => (*name).into(),
-                                        GeneralName::IPAddress(ip) => match ip.len() {
-                                            4 => Ipv4Addr::from(<[u8; 4]>::try_from(*ip).unwrap())
-                                                .to_string(),
-                                            16 => {
-                                                Ipv6Addr::from(<[u8; 16]>::try_from(*ip).unwrap())
-                                                    .to_string()
-                                            }
-                                            _ => continue,
-                                        },
-                                        _ => {
-                                            continue;
-                                        }
-                                    };
-                                    names.insert(name);
-                                }
-                            }
-                        }
+        let der = pem::parse_many(certificate)
+            .map_err(|err| AcmeError::Crypto(format!("Failed to parse PEM: {}", err)))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AcmeError::Crypto("No certificates found in PEM".to_string()))?;
+        Self::parse_der(der.contents())
+    }
 
-                        Ok(ParsedCert {
-                            sans: names.into_iter().collect(),
-                            issuer: cert.tbs_certificate.issuer().to_string(),
-                            valid_not_before: Utc
-                                .timestamp_opt(
-                                    cert.tbs_certificate.validity().not_before.timestamp(),
-                                    0,
-                                )
-                                .single()
-                                .ok_or_else(|| {
-                                    AcmeError::Crypto(
-                                        "Certificate not_before time is out of range".to_string(),
-                                    )
-                                })?,
-                            valid_not_after: Utc
-                                .timestamp_opt(
-                                    cert.tbs_certificate.validity().not_after.timestamp(),
-                                    0,
-                                )
-                                .single()
-                                .ok_or_else(|| {
-                                    AcmeError::Crypto(
-                                        "Certificate not_after time is out of range".to_string(),
-                                    )
-                                })?,
-                        })
-                    })
+    pub fn parse_der(der: &[u8]) -> AcmeResult<ParsedCert> {
+        parse_x509_certificate(der)
+            .map_err(|err| AcmeError::Crypto(format!("Failed to parse X.509 certificate: {}", err)))
+            .and_then(|(_, cert)| {
+                // Add CNs and SANs to the list of names
+                let mut names: BTreeSet<String> = BTreeSet::new();
+                for name in cert.subject().iter_common_name() {
+                    if let Ok(name) = name.as_str() {
+                        names.insert(name.into());
+                    }
+                }
+                for ext in cert.extensions() {
+                    if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                        for name in &san.general_names {
+                            let name = match name {
+                                GeneralName::DNSName(name) => (*name).into(),
+                                GeneralName::IPAddress(ip) => match ip.len() {
+                                    4 => Ipv4Addr::from(<[u8; 4]>::try_from(*ip).unwrap())
+                                        .to_string(),
+                                    16 => Ipv6Addr::from(<[u8; 16]>::try_from(*ip).unwrap())
+                                        .to_string(),
+                                    _ => continue,
+                                },
+                                _ => {
+                                    continue;
+                                }
+                            };
+                            names.insert(name);
+                        }
+                    }
+                }
+
+                Ok(ParsedCert {
+                    sans: names.into_iter().collect(),
+                    issuer: cert.tbs_certificate.issuer().to_string(),
+                    valid_not_before: Utc
+                        .timestamp_opt(cert.tbs_certificate.validity().not_before.timestamp(), 0)
+                        .single()
+                        .ok_or_else(|| {
+                            AcmeError::Crypto(
+                                "Certificate not_before time is out of range".to_string(),
+                            )
+                        })?,
+                    valid_not_after: Utc
+                        .timestamp_opt(cert.tbs_certificate.validity().not_after.timestamp(), 0)
+                        .single()
+                        .ok_or_else(|| {
+                            AcmeError::Crypto(
+                                "Certificate not_after time is out of range".to_string(),
+                            )
+                        })?,
+                })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chain_matches;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    fn self_signed_pem(common_name: &str) -> String {
+        let mut params = CertificateParams::new(vec!["host.example".to_string()]).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, common_name);
+        params.distinguished_name = dn;
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        params.self_signed(&key_pair).unwrap().pem()
+    }
+
+    #[test]
+    fn matches_top_certificate_issuer() {
+        let chain = self_signed_pem("ISRG Root X1");
+        assert!(chain_matches(&chain, "ISRG Root X1"));
+    }
+
+    #[test]
+    fn match_is_case_sensitive() {
+        let chain = self_signed_pem("ISRG Root X1");
+        assert!(!chain_matches(&chain, "isrg root x1"));
+    }
+
+    #[test]
+    fn match_is_exact_not_substring() {
+        let chain = self_signed_pem("ISRG Root X10");
+        assert!(!chain_matches(&chain, "ISRG Root X1"));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_issuer() {
+        let chain = self_signed_pem("ISRG Root X2");
+        assert!(!chain_matches(&chain, "ISRG Root X1"));
+    }
+
+    #[test]
+    fn uses_topmost_certificate_not_leaf() {
+        let leaf = self_signed_pem("Leaf Issuer");
+        let top = self_signed_pem("ISRG Root X1");
+        let chain = format!("{leaf}{top}");
+        assert!(chain_matches(&chain, "ISRG Root X1"));
+        assert!(!chain_matches(&chain, "Leaf Issuer"));
+    }
+
+    #[test]
+    fn rejects_unparseable_chain() {
+        assert!(!chain_matches("not a pem", "ISRG Root X1"));
     }
 }

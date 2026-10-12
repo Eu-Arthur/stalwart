@@ -25,7 +25,7 @@ use jmap_proto::{
     method::set::{SetRequest, SetResponse},
     object::mailbox::{self, MailboxProperty, MailboxValue},
     references::resolve::ResolveCreatedReference,
-    request::IntoValid,
+    request::MaybeInvalid,
     types::state::State,
 };
 use jmap_tools::{JsonPointerItem, Key, Map, Value};
@@ -80,14 +80,16 @@ impl MailboxSet for Server {
         let account_id = request.account_id.document_id();
         let on_destroy_remove_emails = request.arguments.on_destroy_remove_emails.unwrap_or(false);
         let cache = self.get_cached_messages(account_id).await?;
+        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?
+            .with_state(cache.assert_state(true, &request.if_in_state)?);
+        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
         let mut ctx = SetContext {
             account_id,
             is_shared: access_token.is_shared(account_id),
             access_token,
-            response: SetResponse::from_request(&request, self.core.jmap.set_max_objects)?
-                .with_state(cache.assert_state(true, &request.if_in_state)?),
+            response,
             mailbox_ids: RoaringBitmap::from_iter(cache.mailboxes.index.keys()),
-            will_destroy: request.unwrap_destroy().into_valid().collect(),
+            will_destroy,
         };
         let mut change_id = None;
         let account_info = self.account(account_id).await?;
@@ -161,7 +163,16 @@ impl MailboxSet for Server {
         // Process updates
         let mut will_update = Vec::with_capacity(request.update.as_ref().map_or(0, |u| u.len()));
         let mut batch = BatchBuilder::new();
-        'update: for (id, object) in request.unwrap_update().into_valid() {
+        'update: for (id, object) in request.unwrap_update() {
+            let id = match id {
+                MaybeInvalid::Value(id) => id,
+                invalid => {
+                    ctx.response
+                        .not_updated
+                        .append(invalid, SetError::not_found());
+                    continue 'update;
+                }
+            };
             // Make sure id won't be destroyed
             if ctx.will_destroy.contains(&id) {
                 ctx.response
@@ -190,7 +201,23 @@ impl MailboxSet for Server {
                     .caused_by(trc::location!())?;
                 if ctx.is_shared {
                     let acl = mailbox.inner.acls.effective_acl(access_token);
-                    if !acl.contains(Acl::Modify) {
+                    let subscription_only = object.keys().all(|key| {
+                        matches!(
+                            key,
+                            Key::Property(MailboxProperty::IsSubscribed | MailboxProperty::Id)
+                        )
+                    });
+                    if subscription_only {
+                        if !acl.contains(Acl::Read) {
+                            ctx.response.not_updated.append(
+                                id,
+                                SetError::forbidden().with_description(
+                                    "You are not allowed to access this mailbox.",
+                                ),
+                            );
+                            continue 'update;
+                        }
+                    } else if !acl.contains(Acl::Modify) {
                         ctx.response.not_updated.append(
                             id,
                             SetError::forbidden()
@@ -379,7 +406,9 @@ impl MailboxSet for Server {
                     changes.parent_id = 0;
                 }
                 (Key::Property(MailboxProperty::IsSubscribed), Value::Bool(subscribe)) => {
-                    let account_id = ctx.access_token.account_id();
+                    let account_id = ctx
+                        .access_token
+                        .personal_id(ctx.account_id, Collection::Mailbox);
                     if subscribe {
                         if !changes.subscribers.contains(&account_id) {
                             changes.subscribers.push(account_id);
@@ -435,6 +464,17 @@ impl MailboxSet for Server {
                     }
                 }
 
+                (Key::Property(MailboxProperty::Id), value) => {
+                    if update
+                        .as_ref()
+                        .map(|(document_id, _)| Id::from(*document_id))
+                        .is_none_or(|expected| !crate::matches_id(&value, expected))
+                    {
+                        return Ok(Err(SetError::invalid_properties()
+                            .with_property(MailboxProperty::Id)
+                            .with_description("The id property is immutable.".to_string())));
+                    }
+                }
                 _ => {
                     return Ok(Err(SetError::invalid_properties()
                         .with_property(property.into_owned())
@@ -547,16 +587,16 @@ impl MailboxSet for Server {
         if !changes.name.is_empty() {
             // Obtain parent mailbox id
             let lower_name = changes.name.to_lowercase();
-            if update
-                .as_ref()
-                .is_none_or(|(_, m)| m.inner.name != changes.name)
-                && cached_mailboxes.mailboxes.items.iter().any(|m| {
-                    m.name.to_lowercase() == lower_name
-                        && m.parent_id().map_or(0, |id| id + 1) == changes.parent_id
-                })
-            {
-                return Ok(Err(SetError::invalid_properties()
-                    .with_property(MailboxProperty::Name)
+            let current_id = update.as_ref().map(|(document_id, _)| *document_id);
+            if update.as_ref().is_none_or(|(_, m)| {
+                m.inner.name != changes.name || m.inner.parent_id != changes.parent_id
+            }) && let Some(existing) = cached_mailboxes.mailboxes.items.iter().find(|m| {
+                Some(m.document_id) != current_id
+                    && m.parent_id().map_or(0, |id| id + 1) == changes.parent_id
+                    && m.name.to_lowercase() == lower_name
+            }) {
+                return Ok(Err(SetError::already_exists()
+                    .with_existing_id(Id::from(existing.document_id))
                     .with_description(format!(
                         "A mailbox with name '{}' already exists.",
                         changes.name

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use protocol::ObjectId;
 use protocol::capability::Capability;
 use std::borrow::Cow;
 
@@ -74,6 +75,12 @@ pub enum Command {
     // RFC 9208
     GetQuota,
     GetQuotaRoot,
+
+    // RFC 9698
+    GetJmapAccess,
+
+    // RFC 10022
+    UidBatches,
 }
 
 impl Command {
@@ -88,6 +95,19 @@ impl Command {
                 | Command::Expunge(true)
                 | Command::Sort(true)
                 | Command::Thread(true)
+        )
+    }
+
+    pub fn requires_uid(&self) -> bool {
+        matches!(
+            self,
+            Command::Fetch(false)
+                | Command::Search(false)
+                | Command::Copy(false)
+                | Command::Move(false)
+                | Command::Store(false)
+                | Command::Sort(false)
+                | Command::Thread(false)
         )
     }
 }
@@ -146,12 +166,23 @@ pub enum ResponseCode {
     },
 
     // ObjectID
-    MailboxId {
-        mailbox_id: String,
-    },
+    ObjectId(ObjectId),
 
     // USEATTR
     UseAttr,
+
+    // UIDONLY
+    UidRequired,
+
+    // UIDBATCHES
+    TooFew,
+    TooMany,
+
+    // MESSAGELIMIT
+    MessageLimit {
+        limit: u32,
+        uid: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -8,13 +8,14 @@ use crate::{
     Server,
     auth::{
         ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
+        ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM, ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305,
         ACCOUNT_FLAG_ENCRYPT_APPEND, ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
         ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER, ACCOUNT_IS_USER,
         AccountCache, AccountInfo, AccountTenantIds, DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING,
         DomainCache, EmailAddress, EmailAddressRef, EmailCache, MailingListCache, PermissionsGroup,
         RECOVERY_ADMIN_ID, RoleCache, TenantCache, permissions::BuildPermissions,
     },
-    config::smtp::auth::DkimSigner,
+    config::smtp::auth::DkimSigners,
     expr::if_block::BootstrapExprExt,
     network::mta::AddressResolver,
     storage::{
@@ -41,9 +42,14 @@ use store::{
 };
 use trc::{AddContext, StoreEvent};
 use types::id::Id;
+use utils::DomainPart;
 
 impl Server {
     pub async fn domain(&self, domain: &str) -> trc::Result<Option<Arc<DomainCache>>> {
+        let Some(domain) = domain.to_ascii_domain() else {
+            return Ok(None);
+        };
+        let domain = domain.as_ref();
         let domain_names = &self.inner.cache.domain_names;
 
         if let Some(domain_id) = domain_names.get(domain) {
@@ -62,7 +68,7 @@ impl Server {
         } else {
             let domain_names_negative = &self.inner.cache.domain_names_negative;
             if domain_names_negative.get(domain).is_none() {
-                if let Some(domain) = self
+                let mut object = self
                     .registry()
                     .primary_key(
                         ObjectType::Domain.into(),
@@ -70,8 +76,20 @@ impl Server {
                         domain.as_bytes().to_vec(),
                     )
                     .await
-                    .caused_by(trc::location!())?
-                {
+                    .caused_by(trc::location!())?;
+                if object.is_none() {
+                    object = self
+                        .registry()
+                        .primary_key(
+                            ObjectType::Domain.into(),
+                            Property::Aliases,
+                            domain.as_bytes().to_vec(),
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+                }
+
+                if let Some(domain) = object {
                     // Cache positive result
                     let domain_id = domain.id().document_id();
                     let domain = self.domain_by_id(domain_id).await?;
@@ -140,6 +158,15 @@ impl Server {
                 if domain.allow_relaying {
                     flags |= DOMAIN_FLAG_RELAY;
                 }
+
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                if domain.allow_scim_provisioning {
+                    flags |= crate::auth::DOMAIN_FLAG_SCIM_PROVISIONING;
+                }
+                // SPDX-SnippetEnd
+
                 let sub_addressing_custom = match domain.sub_addressing {
                     SubAddressing::Enabled => {
                         flags |= DOMAIN_FLAG_SUB_ADDRESSING;
@@ -230,8 +257,35 @@ impl Server {
                 {
                     let item_id = object.id().document_id();
                     let result = match object.object() {
-                        ObjectType::Account => EmailCache::Account(item_id),
-                        ObjectType::MailingList => EmailCache::MailingList(item_id),
+                        ObjectType::Account => {
+                            if self
+                                .account(item_id)
+                                .await
+                                .caused_by(trc::location!())?
+                                .addresses
+                                .iter()
+                                .any(|address| {
+                                    address.domain_id == domain_id
+                                        && address.local_part.as_ref() == local_part
+                                })
+                            {
+                                EmailCache::Account(item_id)
+                            } else {
+                                EmailCache::DisabledAccountAddress(item_id)
+                            }
+                        }
+                        ObjectType::MailingList => {
+                            if let Some(list) = self.try_list(item_id).await?
+                                && !list.addresses.iter().any(|address| {
+                                    address.domain_id == domain_id
+                                        && address.local_part.as_ref() == local_part
+                                })
+                            {
+                                EmailCache::DisabledListAddress(item_id)
+                            } else {
+                                EmailCache::MailingList(item_id)
+                            }
+                        }
                         _ => {
                             return Err(trc::AuthEvent::Error
                                 .into_err()
@@ -267,6 +321,7 @@ impl Server {
     }
 
     pub async fn rcpt_id_from_email(&self, address: &str) -> trc::Result<Option<EmailCache>> {
+        let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
             if let Some(domain) = self.domain(domain).await? {
                 self.rcpt_id_from_parts(local_part, domain.id).await
@@ -380,6 +435,14 @@ impl Server {
                                 flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_AES128;
                                 settings.into()
                             }
+                            EncryptionAtRest::Aes256Gcm(settings) => {
+                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM;
+                                settings.into()
+                            }
+                            EncryptionAtRest::ChaCha20Poly1305(settings) => {
+                                flags |= ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305;
+                                settings.into()
+                            }
                         };
                         let encryption_key = if let Some(settings) = encryption_settings {
                             if settings.allow_spam_training {
@@ -422,10 +485,16 @@ impl Server {
                                 domain_id: account.domain_id.document_id(),
                             }]
                             .into_iter()
-                            .chain(account.aliases.into_iter().map(|alias| EmailAddress {
-                                local_part: alias.name.into(),
-                                domain_id: alias.domain_id.document_id(),
-                            }))
+                            .chain(
+                                account
+                                    .aliases
+                                    .into_iter()
+                                    .filter(|alias| alias.enabled)
+                                    .map(|alias| EmailAddress {
+                                        local_part: alias.name.into(),
+                                        domain_id: alias.domain_id.document_id(),
+                                    }),
+                            )
                             .collect(),
                             id_tenant: account.member_tenant_id.map(|id| id.document_id()),
                             id_member_of: account
@@ -479,10 +548,16 @@ impl Server {
                                 domain_id: account.domain_id.document_id(),
                             }]
                             .into_iter()
-                            .chain(account.aliases.into_iter().map(|alias| EmailAddress {
-                                local_part: alias.name.into(),
-                                domain_id: alias.domain_id.document_id(),
-                            }))
+                            .chain(
+                                account
+                                    .aliases
+                                    .into_iter()
+                                    .filter(|alias| alias.enabled)
+                                    .map(|alias| EmailAddress {
+                                        local_part: alias.name.into(),
+                                        domain_id: alias.domain_id.document_id(),
+                                    }),
+                            )
                             .collect(),
                             id_tenant: account.member_tenant_id.map(|id| id.document_id()),
                             id_member_of: Default::default(),
@@ -523,6 +598,7 @@ impl Server {
         address: &str,
         resolve: bool,
     ) -> trc::Result<Option<u32>> {
+        let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
             if let Some(domain) = self.domain(domain).await? {
                 let mut local_part = Cow::Borrowed(local_part);
@@ -596,6 +672,28 @@ impl Server {
     pub async fn account_info(&self, id: u32) -> trc::Result<AccountInfo> {
         let account = self.account(id).await?;
         self.build_account_info(account).await
+    }
+
+    pub async fn scheduling_account_info(
+        &self,
+        authenticated_account_id: u32,
+        owner_account_id: u32,
+    ) -> trc::Result<AccountInfo> {
+        let account = self.account(authenticated_account_id).await?;
+        let mut account_info = self.build_account_info(account).await?;
+
+        if owner_account_id != authenticated_account_id {
+            let owner_account = self.account(owner_account_id).await?;
+            let owner_account_info = self.build_account_info(owner_account).await?;
+
+            for address in owner_account_info.addresses {
+                if !account_info.addresses.contains(&address) {
+                    account_info.addresses.push(address);
+                }
+            }
+        }
+
+        Ok(account_info)
     }
 
     pub async fn build_account_info(&self, account: Arc<AccountCache>) -> trc::Result<AccountInfo> {
@@ -764,16 +862,29 @@ impl Server {
                 let Some(list) = self.registry().object::<MailingList>(id.into()).await? else {
                     return Ok(None);
                 };
-                let cache = Arc::new(MailingListCache {
-                    recipients: list.recipients.into_iter().map(Into::into).collect(),
-                });
+                let cache =
+                    Arc::new(MailingListCache {
+                        addresses: [EmailAddress {
+                            local_part: list.name.into(),
+                            domain_id: list.domain_id.document_id(),
+                        }]
+                        .into_iter()
+                        .chain(list.aliases.into_iter().filter(|alias| alias.enabled).map(
+                            |alias| EmailAddress {
+                                local_part: alias.name.into(),
+                                domain_id: alias.domain_id.document_id(),
+                            },
+                        ))
+                        .collect(),
+                        recipients: list.recipients.into_iter().map(Into::into).collect(),
+                    });
                 let _ = guard.insert(cache.clone());
                 Ok(Some(cache))
             }
         }
     }
 
-    pub async fn dkim_signers(&self, domain: &str) -> trc::Result<Option<Arc<[DkimSigner]>>> {
+    pub async fn dkim_signers(&self, domain: &str) -> trc::Result<Option<Arc<DkimSigners>>> {
         let Some(domain) = self.domain(domain).await? else {
             return Ok(None);
         };
@@ -802,26 +913,24 @@ impl Server {
                             .equal(Property::DomainId, domain.id),
                     )
                     .await?;
-                let mut signatures = Vec::with_capacity(ids.len());
+                let domain_name = &domain.names[0];
+                let mut signers = DkimSigners {
+                    dkim1: Vec::with_capacity(ids.len()),
+                    dkim2: None,
+                };
                 for id in ids {
                     if let Some(signature) = self.registry().object::<DkimSignature>(id).await?
                         && matches!(signature.stage(), DkimRotationStage::Active)
+                        && let Err(err) = signers.insert(domain_name.to_string(), signature).await
                     {
-                        match DkimSigner::new(domain.names[0].to_string(), signature).await {
-                            Ok(signer) => signatures.push(signer),
-                            Err(err) => {
-                                trc::error!(
-                                    err.ctx(trc::Key::Id, id.id()).caused_by(trc::location!())
-                                );
-                            }
-                        }
+                        trc::error!(err.ctx(trc::Key::Id, id.id()).caused_by(trc::location!()));
                     }
                 }
 
-                if !signatures.is_empty() {
-                    let signatures: Arc<[DkimSigner]> = signatures.into();
-                    let _ = guard.insert(signatures.clone());
-                    Ok(Some(signatures))
+                if !signers.dkim1.is_empty() || signers.dkim2.is_some() {
+                    let signers = Arc::new(signers);
+                    let _ = guard.insert(signers.clone());
+                    Ok(Some(signers))
                 } else {
                     Ok(None)
                 }

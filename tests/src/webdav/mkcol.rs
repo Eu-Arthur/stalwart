@@ -10,7 +10,6 @@ use crate::webdav::{TEST_FILE_1, TEST_ICAL_1, TEST_VCARD_1, TEST_VTIMEZONE_1};
 
 use crate::utils::server::TestServer;
 
-
 pub async fn test(test: &TestServer) {
     println!("Running MKCOL tests...");
     let client = test.account("john@example.com").webdav_client();
@@ -42,9 +41,18 @@ pub async fn test(test: &TestServer) {
 
     // Create resources under the newly created collections
     for (path, content) in [
-        ("/dav/file/john%40example.com/my-files/file1.txt", TEST_FILE_1),
-        ("/dav/card/john%40example.com/my-cards/card1.vcf", TEST_VCARD_1),
-        ("/dav/cal/john%40example.com/my-events/event1.ics", TEST_ICAL_1),
+        (
+            "/dav/file/john%40example.com/my-files/file1.txt",
+            TEST_FILE_1,
+        ),
+        (
+            "/dav/card/john%40example.com/my-cards/card1.vcf",
+            TEST_VCARD_1,
+        ),
+        (
+            "/dav/cal/john%40example.com/my-events/event1.ics",
+            TEST_ICAL_1,
+        ),
     ] {
         client
             .request("PUT", path, content)
@@ -69,7 +77,10 @@ pub async fn test(test: &TestServer) {
 
     // Creating a sub-collections is allowed in FileDAV but in CalDAV and CardDAV
     for (path, expected_status) in [
-        ("/dav/file/john%40example.com/my-files/my-sub-files", StatusCode::CREATED),
+        (
+            "/dav/file/john%40example.com/my-files/my-sub-files",
+            StatusCode::CREATED,
+        ),
         (
             "/dav/card/john%40example.com/my-cards/my-sub-cards",
             StatusCode::METHOD_NOT_ALLOWED,
@@ -87,9 +98,15 @@ pub async fn test(test: &TestServer) {
 
     // Extended MKCOL with an unsupported resource types should fail
     for (path, resource_type) in [
-        ("/dav/file/john%40example.com/my-named-files", "B:addressbook"),
+        (
+            "/dav/file/john%40example.com/my-named-files",
+            "B:addressbook",
+        ),
         ("/dav/card/john%40example.com/my-named-cards", "A:calendar"),
-        ("/dav/cal/john%40example.com/my-named-events", "B:addressbook"),
+        (
+            "/dav/cal/john%40example.com/my-named-events",
+            "B:addressbook",
+        ),
     ] {
         client
             .mkcol("MKCOL", path, ["D:collection", resource_type], [])
@@ -237,8 +254,26 @@ pub async fn test(test: &TestServer) {
         .with_status(StatusCode::OK)
         .with_values(["A:comp.[name]:VEVENT", "A:comp.[name]:VTODO"]);
 
+    // Resource names arriving through the URI are echoed back verbatim
+    for name in ["My%20Folder", "file(1)+a:b", "%C3%9Cnterlagen", "Q&A"] {
+        let path = format!("/dav/file/john%40example.com/{name}");
+        let href = format!("{path}/");
+        client
+            .request("MKCOL", &path, "")
+            .await
+            .with_status(StatusCode::CREATED);
+        client
+            .propfind(&path, ["D:getetag"])
+            .await
+            .with_hrefs([href.as_str()]);
+    }
+
     // Delete everything
     for path in [
+        "/dav/file/john%40example.com/My%20Folder",
+        "/dav/file/john%40example.com/file(1)+a:b",
+        "/dav/file/john%40example.com/%C3%9Cnterlagen",
+        "/dav/file/john%40example.com/Q&A",
         "/dav/file/john%40example.com/my-files",
         "/dav/card/john%40example.com/my-cards",
         "/dav/cal/john%40example.com/my-events",

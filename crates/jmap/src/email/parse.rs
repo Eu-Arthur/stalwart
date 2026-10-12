@@ -4,21 +4,22 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{
-    body::{ToBodyPart, TruncateBody},
-    headers::HeaderToValue,
-};
 use crate::blob::download::BlobDownload;
 use common::{Server, auth::AccessToken};
 use email::message::index::PREVIEW_LENGTH;
+use email::message::{
+    body::{ToBodyPart, TruncateBody},
+    headers::HeaderToValue,
+};
 use jmap_proto::{
     method::parse::{ParseRequest, ParseResponse},
     object::email::{Email, EmailProperty},
-    request::IntoValid,
+    request::{IntoValid, MaybeInvalid, reference::MaybeIdReference},
 };
 use jmap_tools::{Key, Map, Value};
 use mail_parser::{
-    MessageParser, PartType, decoders::html::html_to_text, parsers::preview::preview_text,
+    HeaderName, MessageParser, MimeHeaders, PartType, decoders::html::html_to_text,
+    parsers::preview::preview_text,
 };
 use std::future::Future;
 use utils::{chained_bytes::ChainedBytes, map::vec_map::VecMap};
@@ -97,20 +98,34 @@ impl EmailParse for Server {
             not_found: vec![],
         };
 
-        for blob_id in request.blob_ids.into_valid() {
+        for blob_id in request.blob_ids {
+            let blob_id = match blob_id {
+                MaybeIdReference::Id(blob_id) => blob_id,
+                MaybeIdReference::Invalid(s) | MaybeIdReference::Reference(s) => {
+                    response.not_found.push(MaybeInvalid::Invalid(s));
+                    continue;
+                }
+            };
             // Fetch raw message to parse
             let raw_message = match self.blob_download(&blob_id, access_token).await? {
                 Some(raw_message) => raw_message,
                 None => {
-                    response.not_found.push(blob_id);
+                    response.not_found.push(MaybeInvalid::Value(blob_id));
                     continue;
                 }
             };
-            let message = if let Some(message) = MessageParser::new().parse(&raw_message) {
+            let message = match MessageParser::new().parse(&raw_message).filter(|message| {
                 message
-            } else {
-                response.not_parsable.push(blob_id);
-                continue;
+                    .root_part()
+                    .headers()
+                    .iter()
+                    .any(|header| !matches!(header.name, HeaderName::Other(_)))
+            }) {
+                Some(message) => message,
+                None => {
+                    response.not_parsable.push(blob_id);
+                    continue;
+                }
             };
             let raw_message = ChainedBytes::new(&raw_message);
 
@@ -232,11 +247,15 @@ impl EmailParse for Server {
                         let mut body_values = Map::with_capacity(message.parts.len());
                         for (part_id, part) in message.parts.iter().enumerate() {
                             let part_id = part_id as u32;
-                            if ((message.html_body.contains(&part_id)
-                                && (fetch_all_body_values || fetch_html_body_values))
-                                || (message.text_body.contains(&part_id)
-                                    && (fetch_all_body_values || fetch_text_body_values)))
-                                && part.is_text()
+                            if part.is_text()
+                                && part
+                                    .content_type()
+                                    .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+                                && (fetch_all_body_values
+                                    || (fetch_html_body_values
+                                        && message.html_body.contains(&part_id))
+                                    || (fetch_text_body_values
+                                        && message.text_body.contains(&part_id)))
                             {
                                 let (is_truncated, value) =
                                     part.body.truncate(max_body_value_bytes);

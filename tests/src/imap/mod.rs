@@ -15,10 +15,14 @@ pub mod fetch;
 pub mod idle;
 pub mod mailbox;
 pub mod managesieve;
+pub mod messagelimit;
+pub mod objectid;
 pub mod pop;
 pub mod search;
 pub mod store;
 pub mod thread;
+pub mod uidbatches;
+pub mod uidonly;
 
 use crate::utils::{
     imap::{AssertResult, ImapConnection, Type},
@@ -232,6 +236,13 @@ pub async fn imap_tests() {
         imap.authenticate(account.name(), account.secret()).await;
     }
 
+    // Test GETJMAPACCESS (RFC 9698)
+    imap.send("GETJMAPACCESS").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("* JMAPACCESS \"")
+        .assert_contains("/.well-known/jmap\"");
+
     // Delete folders
     for mailbox in ["Drafts", "Junk Mail", "Sent Items"] {
         imap.send(&format!("DELETE \"{}\"", mailbox)).await;
@@ -242,12 +253,18 @@ pub async fn imap_tests() {
     append::test(&mut imap, &mut imap_check, &test).await;
     search::test(&mut imap, &mut imap_check, &test).await;
     fetch::test(&mut imap, &mut imap_check).await;
+    objectid::test(&test).await;
     store::test(&mut imap, &mut imap_check, &test).await;
     copy_move::test(&mut imap, &mut imap_check).await;
     thread::test(&mut imap, &mut imap_check, &test).await;
     idle::test(&mut imap, &mut imap_check, false).await;
     condstore::test(&mut imap, &mut imap_check).await;
     acl::test(&mut imap, &mut imap_check, &test).await;
+    uidbatches::test(&mut imap, &mut imap_check).await;
+    messagelimit::test(&mut imap, &mut imap_check).await;
+
+    // UIDONLY cannot be disabled once enabled, so it uses its own connection
+    uidonly::test(&test).await;
 
     // Logout
     for imap in [&mut imap, &mut imap_check] {

@@ -52,6 +52,8 @@ pub struct EmailAddressRef<'x> {
 pub enum EmailCache {
     Account(u32),
     MailingList(u32),
+    DisabledAccountAddress(u32),
+    DisabledListAddress(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,12 @@ pub struct DomainCache {
 
 pub const DOMAIN_FLAG_RELAY: u8 = 1;
 pub const DOMAIN_FLAG_SUB_ADDRESSING: u8 = 1 << 1;
+
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+pub const DOMAIN_FLAG_SCIM_PROVISIONING: u8 = 1 << 2;
+// SPDX-SnippetEnd
 
 #[derive(Debug, Clone, Default)]
 pub struct AccountCache {
@@ -92,6 +100,8 @@ pub const ACCOUNT_FLAG_ENCRYPT_METHOD_PGP: u64 = 1 << 3;
 pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES256: u64 = 1 << 4;
 pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES128: u64 = 1 << 5;
 pub const ACCOUNT_FLAG_ENCRYPT_APPEND: u64 = 1 << 6;
+pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM: u64 = 1 << 7;
+pub const ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305: u64 = 1 << 8;
 
 #[derive(Debug, Clone)]
 pub struct RoleCache {
@@ -101,6 +111,7 @@ pub struct RoleCache {
 
 #[derive(Debug, Clone)]
 pub struct MailingListCache {
+    pub addresses: Box<[EmailAddress]>,
     pub recipients: Arc<[Box<str>]>,
 }
 
@@ -137,6 +148,7 @@ pub struct AccessTokenInner {
     pub(crate) concurrent_uploads: Option<ConcurrencyLimiter>,
     pub(crate) revision_account: u64,
     pub(crate) revision: u64,
+    pub(crate) credential_version: u64,
     pub(crate) obj_size: u64,
 }
 
@@ -194,7 +206,11 @@ impl CacheItemWeight for EmailCache {
 impl CacheItemWeight for DomainCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<DomainCache>() as u64
-            + self.names.iter().map(|s| s.len() as u64).sum::<u64>()
+            + self
+                .names
+                .iter()
+                .map(|s| s.len() as u64 + std::mem::size_of::<Box<str>>() as u64)
+                .sum::<u64>()
             + self.catch_all.as_ref().map_or(0, |s| s.len() as u64)
             + self
                 .sub_addressing_custom
@@ -226,12 +242,18 @@ impl Hash for EmailAddressRef<'_> {
 impl CacheItemWeight for AccountCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<AccountCache>() as u64
+            + self.name.len() as u64
             + self
                 .addresses
                 .iter()
                 .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
                 .sum::<u64>()
             + self.description.as_ref().map_or(0, |s| s.len() as u64)
+            + self.encryption_key.as_ref().map_or(0, |keys| {
+                keys.iter()
+                    .map(|k| k.len() as u64 + std::mem::size_of::<Box<[u8]>>() as u64)
+                    .sum::<u64>()
+            })
     }
 }
 
@@ -244,8 +266,16 @@ impl CacheItemWeight for RoleCache {
 impl CacheItemWeight for MailingListCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<MailingListCache>() as u64
-            //+ self.addresses.iter().map(|s| s.len() as u64).sum::<u64>()
-            + self.recipients.iter().map(|s| s.len() as u64).sum::<u64>()
+            + self
+                .addresses
+                .iter()
+                .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
+                .sum::<u64>()
+            + self
+                .recipients
+                .iter()
+                .map(|s| s.len() as u64 + std::mem::size_of::<Box<str>>() as u64)
+                .sum::<u64>()
     }
 }
 
@@ -293,8 +323,23 @@ impl<'x> EmailAddressRef<'x> {
     }
 }
 
+impl AccountCache {
+    pub fn domain_id(&self) -> Option<u32> {
+        self.addresses.first().map(|address| address.domain_id)
+    }
+}
+
 impl DomainCache {
     pub fn name(&self) -> &str {
         self.names.first().map(|s| s.as_ref()).unwrap_or_default()
     }
+
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[inline]
+    pub fn allows_scim_provisioning(&self) -> bool {
+        (self.flags & DOMAIN_FLAG_SCIM_PROVISIONING) != 0
+    }
+    // SPDX-SnippetEnd
 }

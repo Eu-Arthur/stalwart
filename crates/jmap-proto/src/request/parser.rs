@@ -10,8 +10,7 @@ use super::{
 };
 use crate::request::{
     CopyRequestMethod, GetRequestMethod, ParseRequestMethod, QueryChangesRequestMethod,
-    QueryRequestMethod, SetRequestMethod,
-    deserialize::{DeserializeArguments, deserialize_request},
+    QueryRequestMethod, SetRequestMethod, deserialize::DeserializeArguments,
 };
 use serde::{
     Deserialize, Deserializer,
@@ -79,9 +78,9 @@ impl<'de> Visitor<'de> for CallVisitor {
         V: SeqAccess<'de>,
     {
         let method_name = seq
-            .next_element::<&str>()?
+            .next_element::<std::borrow::Cow<str>>()?
             .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let name = match MethodName::parse(method_name) {
+        let name = match MethodName::parse(method_name.as_ref()) {
             Some(name) => name,
             None => {
                 // Ignore the rest of the call
@@ -713,7 +712,45 @@ impl<'de> Deserialize<'de> for Request<'de> {
     where
         D: Deserializer<'de>,
     {
-        deserialize_request(deserializer)
+        struct RequestVisitor;
+
+        impl<'de> Visitor<'de> for RequestVisitor {
+            type Value = Request<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JMAP request object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut target = Request::default();
+                let mut has_using = false;
+                let mut has_method_calls = false;
+
+                while let Some(key) = map.next_key::<&str>()? {
+                    match key {
+                        "using" => has_using = true,
+                        "methodCalls" => has_method_calls = true,
+                        _ => {}
+                    }
+                    target
+                        .deserialize_argument(key, &mut map)
+                        .map_err(de::Error::custom)?;
+                }
+
+                if !has_using || !has_method_calls {
+                    return Err(de::Error::custom(
+                        "Request is missing the \"using\" or \"methodCalls\" property.",
+                    ));
+                }
+
+                Ok(target)
+            }
+        }
+
+        deserializer.deserialize_map(RequestVisitor)
     }
 }
 
@@ -882,10 +919,30 @@ mod tests {
       }
     "##;
 
+    const TEST_ESCAPED_SOLIDUS: &str = r#"
+    {
+        "using": [ "urn:ietf:params:jmap:core" ],
+        "methodCalls": [
+          [ "Core\/echo", { "hello": true }, "c1" ]
+        ]
+      }
+    "#;
+
     #[test]
     fn parse_request() {
         println!("{:#?}", Request::parse(TEST.as_bytes(), 10, 10240));
         println!("{:#?}", Request::parse(TEST1.as_bytes(), 10, 10240));
         println!("{:#?}", Request::parse(TEST2.as_bytes(), 10, 10240));
+    }
+
+    #[test]
+    fn parse_method_name_with_escaped_solidus() {
+        let request = Request::parse(TEST_ESCAPED_SOLIDUS.as_bytes(), 10, 10240)
+            .expect("escaped solidus in method name must parse");
+        assert_eq!(request.method_calls.len(), 1);
+        assert!(matches!(
+            request.method_calls[0].method,
+            super::RequestMethod::Echo(_)
+        ));
     }
 }

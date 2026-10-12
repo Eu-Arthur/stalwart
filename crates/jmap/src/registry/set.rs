@@ -30,14 +30,16 @@ use crate::registry::{
 use common::{
     Server, auth::AccessToken, cache::invalidate::CacheInvalidationBuilder,
     expr::if_block::BootstrapExprExt, ipc::CacheInvalidation,
+    manager::application::WebApplicationManager,
 };
+use directory::core::secret::{hash_secret, is_password_hash};
 use http_proto::HttpSessionData;
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::set::{SetRequest, SetResponse},
     object::registry::Registry,
     references::resolve::ResolveCreatedReference,
-    request::IntoValid,
+    request::{IntoValid, MaybeInvalid},
 };
 use jmap_tools::{JsonPointer, JsonPointerItem, Key};
 use registry::{
@@ -124,9 +126,11 @@ impl RegistrySet for Server {
         // Initial destroy validation for singletons
         let mut destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
         if is_singleton && !destroy.is_empty() {
-            response
-                .not_destroyed
-                .extend(destroy.drain(..).map(|id| (id, SetError::singleton())));
+            response.not_destroyed.extend(
+                destroy
+                    .drain(..)
+                    .map(|id| (MaybeInvalid::Value(id), SetError::singleton())),
+            );
         }
 
         // Update validation for willDestroy
@@ -427,10 +431,11 @@ impl RegistrySet for Server {
                     let mut tasks = Vec::new();
                     let result = match &mut new_object.inner {
                         ObjectInner::Account(account) => {
-                            validate_account(&set, account, modification.as_account()).await?
+                            validate_account(self, access_token, account, modification.as_account())
+                                .await?
                         }
                         ObjectInner::Role(role) => {
-                            validate_role(&set, role, modification.as_role()).await?
+                            validate_role(self, access_token, role, modification.as_role()).await?
                         }
                         // SPDX-SnippetBegin
                         // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -461,13 +466,44 @@ impl RegistrySet for Server {
                             validate_dns_server(&set, dns, modification.as_dns_server()).await?
                         }
                         ObjectInner::MailingList(_) if is_create => {
-                            validate_tenant_quota(&set, TenantStorageQuota::MaxMailingLists).await?
+                            validate_tenant_quota(
+                                self,
+                                access_token,
+                                TenantStorageQuota::MaxMailingLists,
+                            )
+                            .await?
                         }
-                        ObjectInner::OAuthClient(_) if is_create => {
-                            validate_tenant_quota(&set, TenantStorageQuota::MaxOauthClients).await?
+                        ObjectInner::OAuthClient(client) => {
+                            if let Some(secret) = client.secret.as_mut()
+                                && !secret.is_empty()
+                                && !(matches!(secret.as_bytes().first(), Some(&b'$' | &b'{'))
+                                    && is_password_hash(secret))
+                            {
+                                *secret = hash_secret(
+                                    set.server.core.network.security.password_hash_algorithm,
+                                    std::mem::take(secret).into_bytes(),
+                                )
+                                .await
+                                .caused_by(trc::location!())?;
+                            }
+                            if is_create {
+                                validate_tenant_quota(
+                                    self,
+                                    access_token,
+                                    TenantStorageQuota::MaxOauthClients,
+                                )
+                                .await?
+                            } else {
+                                Ok(ObjectResponse::default())
+                            }
                         }
                         ObjectInner::Directory(_) if is_create => {
-                            validate_tenant_quota(&set, TenantStorageQuota::MaxDirectories).await?
+                            validate_tenant_quota(
+                                self,
+                                access_token,
+                                TenantStorageQuota::MaxDirectories,
+                            )
+                            .await?
                         }
                         ObjectInner::AcmeProvider(provider) if is_create => {
                             validate_acme_provider(&set, provider, unpatched_properties).await?
@@ -568,6 +604,18 @@ impl RegistrySet for Server {
                     let object_id = match (modification, result) {
                         (Modification::Update { id, object }, RegistryWriteResult::Success(_)) => {
                             cache_invalidator.process_update(id, &object, &new_object);
+                            if let (
+                                ObjectInner::Application(previous),
+                                ObjectInner::Application(updated),
+                            ) = (&object.inner, &new_object.inner)
+                                && previous.resource_url != updated.resource_url
+                                && let Err(err) =
+                                    WebApplicationManager::delete_bundle(self, id).await
+                            {
+                                trc::error!(
+                                    err.details("Failed to delete cached application bundle")
+                                );
+                            }
                             set.response.updated.append(
                                 id,
                                 if !response.object.is_empty() {
@@ -582,6 +630,7 @@ impl RegistrySet for Server {
                             Modification::Create { client_id, .. },
                             RegistryWriteResult::Success(id),
                         ) => {
+                            cache_invalidator.process_create(&new_object);
                             response.object.insert(Property::Id, RegistryValue::Id(id));
                             set.response
                                 .created
@@ -663,6 +712,15 @@ impl RegistrySet for Server {
                                     schedule_account_destruction(set.server, id, account).await?;
                                 }
 
+                                if matches!(object.inner, ObjectInner::Application(_))
+                                    && let Err(err) =
+                                        WebApplicationManager::delete_bundle(self, id).await
+                                {
+                                    trc::error!(
+                                        err.details("Failed to delete cached application bundle")
+                                    );
+                                }
+
                                 cache_invalidator.process_delete(id, &object);
                                 set.response.destroyed.push(id);
                             }
@@ -701,7 +759,9 @@ impl RegistrySet for Server {
             ObjectType::AccountSettings
             | ObjectType::ApiKey
             | ObjectType::AccountPassword
-            | ObjectType::AppPassword => account_set(set).await.map(|set| set.into_response()),
+            | ObjectType::AppPassword => Box::pin(account_set(set))
+                .await
+                .map(|set| set.into_response()),
 
             ObjectType::QueuedMessage => {
                 queued_message_set(set).await.map(|set| set.into_response())
@@ -709,7 +769,9 @@ impl RegistrySet for Server {
 
             ObjectType::Task => task_set(set).await.map(|set| set.into_response()),
 
-            ObjectType::Action => action_set(set).await.map(|set| set.into_response()),
+            ObjectType::Action => Box::pin(action_set(set))
+                .await
+                .map(|set| set.into_response()),
 
             ObjectType::Bootstrap => Box::pin(bootstrap_set(set))
                 .await

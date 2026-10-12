@@ -270,6 +270,7 @@ pub enum CoordinatorType {
     Zenoh = 4,
     Redis = 5,
     RedisCluster = 6,
+    RedisSentinel = 7,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -346,6 +347,15 @@ pub enum DirectoryType {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(u16)]
+pub enum Dkim2Flag {
+    #[default]
+    Donotmodify = 0,
+    Donotexplode = 1,
+    Feedback = 2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
 pub enum DkimAuthResult {
     #[default]
     None = 0,
@@ -399,6 +409,8 @@ pub enum DkimSignatureType {
     #[default]
     Dkim1Ed25519Sha256 = 0,
     Dkim1RsaSha256 = 1,
+    Dkim2Ed25519Sha256 = 2,
+    Dkim2RsaSha256 = 3,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -423,6 +435,15 @@ pub enum DmarcAlignment {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(u16)]
+pub enum DmarcDiscovery {
+    #[default]
+    Psl = 0,
+    Treewalk = 1,
+    Unspecified = 2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
 pub enum DmarcDisposition {
     #[default]
     None = 0,
@@ -441,6 +462,7 @@ pub enum DmarcPolicyOverride {
     MailingList = 3,
     LocalPolicy = 4,
     Other = 5,
+    PolicyTestMode = 6,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -596,6 +618,7 @@ pub enum DnsServerBootstrapType {
     Vultr = 68,
     WebSupport = 69,
     YandexCloud = 70,
+    PowerDns = 71,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -672,6 +695,7 @@ pub enum DnsServerType {
     Vultr = 67,
     WebSupport = 68,
     YandexCloud = 69,
+    PowerDns = 70,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -681,6 +705,8 @@ pub enum EncryptionAtRestType {
     Disabled = 0,
     Aes128 = 1,
     Aes256 = 2,
+    Aes256Gcm = 3,
+    ChaCha20Poly1305 = 4,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -809,8 +835,9 @@ pub enum ExpressionVariable {
     ToLocal = 86,
     ToName = 87,
     Url = 88,
-    Value = 89,
-    ValueLower = 90,
+    UrlOriginal = 89,
+    Value = 90,
+    ValueLower = 91,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -846,6 +873,7 @@ pub enum InMemoryStoreBaseType {
     #[default]
     Redis = 0,
     RedisCluster = 1,
+    RedisSentinel = 2,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -856,6 +884,7 @@ pub enum InMemoryStoreType {
     Sharded = 1,
     Redis = 2,
     RedisCluster = 3,
+    RedisSentinel = 4,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -905,10 +934,10 @@ pub enum JwtSignatureAlgorithm {
 #[repr(u16)]
 pub enum Locale {
     #[default]
-    POSIX = 0,
+    EnUS = 0,
     AaDJ = 1,
     AaER = 2,
-    AaERSaaho = 3,
+    SsyER = 3,
     AaET = 4,
     AfZA = 5,
     AgrPE = 6,
@@ -941,7 +970,7 @@ pub enum Locale {
     AzAZ = 33,
     AzIR = 34,
     BeBY = 35,
-    BeBYLatin = 36,
+    BeLatnBY = 36,
     BemZM = 37,
     BerDZ = 38,
     BerMA = 39,
@@ -955,13 +984,13 @@ pub enum Locale {
     BoCN = 47,
     BoIN = 48,
     BrFR = 49,
-    BrFREuro = 50,
+    Es419 = 50,
     BrxIN = 51,
     BsBA = 52,
     BynER = 53,
     CaAD = 54,
     CaES = 55,
-    CaESEuro = 56,
+    En150 = 56,
     CaESValencia = 57,
     CaFR = 58,
     CaIT = 59,
@@ -975,23 +1004,20 @@ pub enum Locale {
     CyGB = 67,
     DaDK = 68,
     DeAT = 69,
-    DeATEuro = 70,
     DeBE = 71,
-    DeBEEuro = 72,
+    En001 = 72,
     DeCH = 73,
     DeDE = 74,
-    DeDEEuro = 75,
     DeIT = 76,
     DeLI = 77,
     DeLU = 78,
-    DeLUEuro = 79,
+    Ar001 = 79,
     DoiIN = 80,
     DsbDE = 81,
     DvMV = 82,
     DzBT = 83,
     ElCY = 84,
     ElGR = 85,
-    ElGREuro = 86,
     EnAG = 87,
     EnAU = 88,
     EnBW = 89,
@@ -1000,7 +1026,6 @@ pub enum Locale {
     EnGB = 92,
     EnHK = 93,
     EnIE = 94,
-    EnIEEuro = 95,
     EnIL = 96,
     EnIN = 97,
     EnNG = 98,
@@ -1008,7 +1033,6 @@ pub enum Locale {
     EnPH = 100,
     EnSC = 101,
     EnSG = 102,
-    EnUS = 103,
     EnZA = 104,
     EnZM = 105,
     EnZW = 106,
@@ -1022,7 +1046,6 @@ pub enum Locale {
     EsDO = 114,
     EsEC = 115,
     EsES = 116,
-    EsESEuro = 117,
     EsGT = 118,
     EsHN = 119,
     EsMX = 120,
@@ -1037,33 +1060,30 @@ pub enum Locale {
     EsVE = 129,
     EtEE = 130,
     EuES = 131,
-    EuESEuro = 132,
+    ZhHans = 132,
     FaIR = 133,
     FfSN = 134,
     FiFI = 135,
-    FiFIEuro = 136,
     FilPH = 137,
     FoFO = 138,
     FrBE = 139,
-    FrBEEuro = 140,
     FrCA = 141,
     FrCH = 142,
     FrFR = 143,
-    FrFREuro = 144,
     FrLU = 145,
-    FrLUEuro = 146,
+    ZhHant = 146,
     FurIT = 147,
     FyDE = 148,
     FyNL = 149,
     GaIE = 150,
-    GaIEEuro = 151,
+    ZhHantHK = 151,
     GdGB = 152,
     GezER = 153,
-    GezERAbegede = 154,
+    SrLatnBA = 154,
     GezET = 155,
-    GezETAbegede = 156,
+    SrLatnME = 156,
     GlES = 157,
-    GlESEuro = 158,
+    AzLatnAZ = 158,
     GuIN = 159,
     GvGB = 160,
     HaNG = 161,
@@ -1084,7 +1104,6 @@ pub enum Locale {
     IsIS = 176,
     ItCH = 177,
     ItIT = 178,
-    ItITEuro = 179,
     IuCA = 180,
     JaJP = 181,
     KaGE = 182,
@@ -1096,7 +1115,7 @@ pub enum Locale {
     KoKR = 188,
     KokIN = 189,
     KsIN = 190,
-    KsINDevanagari = 191,
+    KsDevaIN = 191,
     KuTR = 192,
     KwGB = 193,
     KyKG = 194,
@@ -1129,7 +1148,7 @@ pub enum Locale {
     MtMT = 221,
     MyMM = 222,
     NanTW = 223,
-    NanTWLatin = 224,
+    NanLatnTW = 224,
     NbNO = 225,
     NdsDE = 226,
     NdsNL = 227,
@@ -1139,9 +1158,7 @@ pub enum Locale {
     NiuNZ = 231,
     NlAW = 232,
     NlBE = 233,
-    NlBEEuro = 234,
     NlNL = 235,
-    NlNLEuro = 236,
     NnNO = 237,
     NrZA = 238,
     NsoZA = 239,
@@ -1158,7 +1175,6 @@ pub enum Locale {
     PsAF = 250,
     PtBR = 251,
     PtPT = 252,
-    PtPTEuro = 253,
     QuzPE = 254,
     RajIN = 255,
     RoRO = 256,
@@ -1170,7 +1186,7 @@ pub enum Locale {
     SatIN = 262,
     ScIT = 263,
     SdIN = 264,
-    SdINDevanagari = 265,
+    SdDevaIN = 265,
     SeNO = 266,
     SgsLT = 267,
     ShnMM = 268,
@@ -1188,11 +1204,10 @@ pub enum Locale {
     SqMK = 280,
     SrME = 281,
     SrRS = 282,
-    SrRSLatin = 283,
+    SrLatnRS = 283,
     SsZA = 284,
     StZA = 285,
     SvFI = 286,
-    SvFIEuro = 287,
     SvSE = 288,
     SwKE = 289,
     SwTZ = 290,
@@ -1216,18 +1231,18 @@ pub enum Locale {
     TrTR = 308,
     TsZA = 309,
     TtRU = 310,
-    TtRUIqtelif = 311,
+    TtLatnRU = 311,
     UgCN = 312,
     UkUA = 313,
     UnmUS = 314,
     UrIN = 315,
     UrPK = 316,
     UzUZ = 317,
-    UzUZCyrillic = 318,
+    UzCyrlUZ = 318,
     VeZA = 319,
     ViVN = 320,
     WaBE = 321,
-    WaBEEuro = 322,
+    UzLatnUZ = 322,
     WaeCH = 323,
     WalET = 324,
     WoSN = 325,
@@ -1263,6 +1278,7 @@ pub enum LookupStoreType {
     Sharded = 3,
     Redis = 4,
     RedisCluster = 5,
+    RedisSentinel = 6,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1711,6 +1727,7 @@ pub enum Permission {
     LiveTracing = 216,
     LiveMetrics = 217,
     LiveDeliveryTest = 218,
+    ScimAccess = 660,
     SysAccountGet = 219,
     SysAccountCreate = 220,
     SysAccountUpdate = 221,
@@ -2192,6 +2209,16 @@ pub enum ProviderInfo {
     LogoUrl = 5,
     LogoWidth = 6,
     LogoHeight = 7,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum PublicStringOptionalType {
+    #[default]
+    None = 0,
+    Value = 1,
+    EnvironmentVariable = 2,
+    File = 3,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -3500,6 +3527,14 @@ pub enum UserRolesType {
     Custom = 2,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum VCardVersion {
+    #[default]
+    V4 = 0,
+    V3 = 1,
+}
+
 pub static HTTP_VARIABLE: &[ExpressionVariable] = &[
     ExpressionVariable::Listener,
     ExpressionVariable::RemoteIp,
@@ -3870,6 +3905,7 @@ pub static SPAM_IP_VARIABLE: &[ExpressionVariable] = &[
 
 pub static SPAM_URL_VARIABLE: &[ExpressionVariable] = &[
     ExpressionVariable::Url,
+    ExpressionVariable::UrlOriginal,
     ExpressionVariable::Value,
     ExpressionVariable::PathQuery,
     ExpressionVariable::Path,

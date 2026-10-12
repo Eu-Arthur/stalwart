@@ -13,9 +13,9 @@ use dav_proto::{
 };
 use groupware::DavResourceName;
 use hyper::{HeaderMap, Method, StatusCode, header::AUTHORIZATION};
-use quick_xml::{Reader, events::Event};
+use quick_xml::{NsReader, Reader, XmlVersion, events::Event, name::ResolveResult};
 use std::{borrow::Cow, time::Duration};
-use store::rand::{Rng, distr::Alphanumeric, rng};
+use store::rand::{RngExt, distr::Alphanumeric, rng};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -135,7 +135,15 @@ impl DummyWebDavClient {
             .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
             .map_err(|err| err.to_string());
         let xml = match &body {
-            Ok(body) if body.starts_with("<?xml") => flatten_xml(body),
+            Ok(body) if body.starts_with("<?xml") => {
+                if let Some(prefix) = undeclared_xml_prefix(body) {
+                    panic!(
+                        "Response uses undeclared namespace prefix {prefix:?}: {}",
+                        xml_pretty_print(body)
+                    );
+                }
+                flatten_xml(body)
+            }
             _ => vec![],
         };
 
@@ -1119,6 +1127,29 @@ impl Default for DavItem {
     }
 }
 
+fn undeclared_xml_prefix(xml: &str) -> Option<String> {
+    let mut reader = NsReader::from_str(xml);
+    let mut buf = Vec::new();
+
+    loop {
+        let (resolved, event) = reader.read_resolved_event_into(&mut buf).unwrap();
+        let name = match &event {
+            Event::Start(e) | Event::Empty(e) => e.name(),
+            Event::Eof => return None,
+            _ => {
+                buf.clear();
+                continue;
+            }
+        };
+
+        if matches!(resolved, ResolveResult::Unknown(_)) {
+            return Some(String::from_utf8_lossy(name.as_ref()).into_owned());
+        }
+
+        buf.clear();
+    }
+}
+
 fn flatten_xml(xml: &str) -> Vec<(String, String)> {
     let mut reader = Reader::from_str(xml);
 
@@ -1136,7 +1167,7 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 for attr in e.attributes() {
                     let attr = attr.unwrap();
                     let key = str::from_utf8(attr.key.as_ref()).unwrap().to_string();
-                    let value = attr.unescape_value().unwrap();
+                    let value = attr.normalized_value(XmlVersion::Implicit1_0).unwrap();
                     let value_str = value.trim().to_string();
 
                     result.push((format!("{}.[{}]", base_path, key), value_str));
@@ -1151,7 +1182,7 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 for attr in e.attributes() {
                     let attr = attr.unwrap();
                     let key = str::from_utf8(attr.key.as_ref()).unwrap().to_string();
-                    let value = attr.unescape_value().unwrap();
+                    let value = attr.normalized_value(XmlVersion::Implicit1_0).unwrap();
                     let value_str = value.trim().to_string();
                     has_attrs = true;
                     result.push((format!("{}.[{}]", base_path, key), value_str));
@@ -1162,7 +1193,7 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Event::Text(e) => {
-                let text = e.xml_content().unwrap();
+                let text = e.xml_content(XmlVersion::Implicit1_0).unwrap();
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     if let Some(text_content) = text_content.as_mut() {

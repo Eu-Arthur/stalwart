@@ -18,7 +18,7 @@ use store::{
     search::{SearchComparator, SearchFilter, SearchQuery},
     write::SearchIndex,
 };
-use types::{acl::Acl, special_use::SpecialUse};
+use types::{acl::Acl, collection::Collection, special_use::SpecialUse};
 
 pub trait MailboxQuery: Sync + Send {
     fn mailbox_query(
@@ -35,6 +35,7 @@ impl MailboxQuery for Server {
         access_token: &AccessToken,
     ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
+        let personal_id = access_token.personal_id(account_id, Collection::Mailbox);
         let sort_as_tree = request.arguments.sort_as_tree.unwrap_or(false);
         let filter_as_tree = request.arguments.filter_as_tree.unwrap_or(false);
         let mut filters = Vec::with_capacity(request.filter.len());
@@ -59,7 +60,7 @@ impl MailboxQuery for Server {
                             ));
                         }
                         MailboxFilter::Name(name) => {
-                            #[cfg(feature = "test_mode")]
+                            #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
                             {
                                 // Used for concurrent requests tests
                                 if name == "__sleep" {
@@ -120,8 +121,7 @@ impl MailboxQuery for Server {
                                     .items
                                     .iter()
                                     .filter(|mailbox| {
-                                        mailbox.subscribers.contains(&access_token.account_id())
-                                            == is_subscribed
+                                        mailbox.subscribers.contains(&personal_id) == is_subscribed
                                     })
                                     .map(|m| m.document_id)
                                     .collect::<RoaringBitmap>(),

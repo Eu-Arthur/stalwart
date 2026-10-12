@@ -13,10 +13,10 @@ use common::{network::SessionStream, storage::index::ObjectIndexBuilder};
 use email::cache::{MessageCacheFetch, mailbox::MailboxCacheAccess};
 use imap_proto::{
     Command, ResponseCode, StatusResponse,
-    protocol::{create::Arguments, list::Attribute},
+    protocol::{ObjectId, create::Arguments, list::Attribute},
     receiver::Request,
 };
-use registry::schema::enums::Permission;
+use registry::schema::enums::{Permission, StorageQuota};
 use std::time::Instant;
 use store::write::BatchBuilder;
 use trc::AddContext;
@@ -29,11 +29,12 @@ impl<T: SessionStream> Session<T> {
 
         let data = self.state.session_data();
         let is_utf8 = self.is_utf8;
+        let is_objectid = self.is_objectid;
 
         spawn_op!(data, {
             for request in requests {
                 match request.parse_create(is_utf8) {
-                    Ok(argument) => match data.create_folder(argument).await {
+                    Ok(argument) => match data.create_folder(argument, is_objectid).await {
                         Ok(response) => {
                             data.write_bytes(response.into_bytes()).await?;
                         }
@@ -51,7 +52,11 @@ impl<T: SessionStream> Session<T> {
 }
 
 impl<T: SessionStream> SessionData<T> {
-    pub async fn create_folder(&self, arguments: Arguments) -> trc::Result<StatusResponse> {
+    pub async fn create_folder(
+        &self,
+        arguments: Arguments,
+        is_objectid: bool,
+    ) -> trc::Result<StatusResponse> {
         let op_start = Instant::now();
 
         // Refresh mailboxes
@@ -65,6 +70,36 @@ impl<T: SessionStream> SessionData<T> {
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
         debug_assert!(!params.path.is_empty());
+
+        // Validate quota
+        let account = self
+            .server
+            .account(params.account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
+        let mailbox_count = self
+            .server
+            .get_cached_messages(params.account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?
+            .mailboxes
+            .items
+            .len();
+        if mailbox_count + params.path.len()
+            > self
+                .server
+                .object_quota(account.object_quotas(), StorageQuota::MaxMailboxes)
+                as usize
+        {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details(concat!(
+                    "There are too many mailboxes, ",
+                    "please delete some before adding a new one."
+                ))
+                .code(ResponseCode::OverQuota)
+                .id(arguments.tag.clone()));
+        }
 
         // Build batch
         let mut parent_id = params.parent_mailbox_id.map(|id| id + 1).unwrap_or(0);
@@ -119,11 +154,16 @@ impl<T: SessionStream> SessionData<T> {
         );
 
         // Build response
-        Ok(StatusResponse::ok("Mailbox created.")
-            .with_code(ResponseCode::MailboxId {
-                mailbox_id: Id::from_parts(params.account_id, parent_id - 1).to_string(),
-            })
-            .with_tag(arguments.tag))
+        let response = StatusResponse::ok("Mailbox created.").with_tag(arguments.tag);
+        Ok(if is_objectid {
+            response.with_code(ResponseCode::ObjectId(ObjectId {
+                mailbox_id: Some(Id::from(parent_id - 1)),
+                account_id: Some(Id::from(params.account_id)),
+                ..Default::default()
+            }))
+        } else {
+            response
+        })
     }
 
     pub async fn validate_mailbox_create<'x>(

@@ -7,7 +7,7 @@
 use crate::BlobStore;
 use registry::schema::structs;
 use s3::{Bucket, Region, creds::Credentials};
-use std::{fmt::Display, io::Write, ops::Range, sync::Arc, time::Duration};
+use std::{io::Write, ops::Range, sync::Arc, time::Duration};
 use utils::codec::base32_custom::Base32Writer;
 
 pub struct S3Store {
@@ -26,7 +26,10 @@ impl S3Store {
             structs::S3StoreRegion::UsWest1 => Region::UsWest1,
             structs::S3StoreRegion::UsWest2 => Region::UsWest2,
             structs::S3StoreRegion::CaCentral1 => Region::CaCentral1,
-            structs::S3StoreRegion::AfSouth1 => Region::AfSouth1,
+            structs::S3StoreRegion::AfSouth1 => Region::Custom {
+                region: "af-south-1".into(),
+                endpoint: "s3.af-south-1.amazonaws.com".into(),
+            },
             structs::S3StoreRegion::ApEast1 => Region::ApEast1,
             structs::S3StoreRegion::ApSouth1 => Region::ApSouth1,
             structs::S3StoreRegion::ApNortheast1 => Region::ApNortheast1,
@@ -69,7 +72,7 @@ impl S3Store {
             },
         };
         let credentials = Credentials::new(
-            config.access_key.as_deref(),
+            config.access_key.value().await?.as_deref(),
             config.secret_key.secret().await?.as_deref(),
             config.security_token.secret().await?.as_deref(),
             config.session_token.secret().await?.as_deref(),
@@ -81,11 +84,8 @@ impl S3Store {
             bucket: Bucket::new(&config.bucket, region, credentials)
                 .map_err(|err| format!("Failed to create bucket: {err:?}"))?
                 .with_path_style()
-                /*.set_dangereous_config(allow_invalid, allow_invalid)
-                .map_err(|err| {
-                    format!("Failed to create bucket: {err:?}")
-                })
-                ?*/
+                .set_dangerous_config(config.allow_invalid_certs, config.allow_invalid_certs)
+                .map_err(|err| format!("Failed to create bucket: {err:?}"))?
                 .with_request_timeout(config.timeout.into_inner())
                 .map_err(|err| format!("Failed to create bucket: {err:?}"))?,
             max_retries: config.max_retries as u32,
@@ -247,7 +247,13 @@ impl S3Store {
     }
 }
 
-#[inline(always)]
-fn into_error(err: impl Display) -> trc::Error {
-    trc::StoreEvent::S3Error.reason(err)
+fn into_error(err: impl std::error::Error) -> trc::Error {
+    let mut reason = err.to_string();
+    let mut source = err.source();
+    while let Some(err) = source {
+        reason.push_str(": ");
+        reason.push_str(&err.to_string());
+        source = err.source();
+    }
+    trc::StoreEvent::S3Error.reason(reason)
 }

@@ -32,6 +32,7 @@ pub enum AcmeError {
     Json(serde_json::Error),
     Crypto(String),
     Invalid(String),
+    NotDue(String),
     Dns(String),
     AuthInvalid(String),
     OrderInvalid(String),
@@ -216,10 +217,10 @@ impl Display for AuthStatus {
 }
 
 impl Auth {
-    pub fn into_error(self) -> String {
+    pub fn to_error(&self) -> String {
         let mut errors = format!("Status: {}", self.status);
-        for challenge in self.challenges {
-            if let Some(error) = challenge.error {
+        for challenge in &self.challenges {
+            if let Some(error) = &challenge.error {
                 errors.push_str(&format!(
                     "; Challenge type: {}, error: {}",
                     challenge.typ.as_str(),
@@ -229,6 +230,14 @@ impl Auth {
         }
 
         errors
+    }
+}
+
+impl Identifier {
+    pub fn hostname(&self) -> &str {
+        match self {
+            Identifier::Dns(hostname) => hostname,
+        }
     }
 }
 
@@ -257,6 +266,7 @@ impl Display for AcmeError {
             AcmeError::Dns(err) => write!(f, "DNS error: {}", err),
             AcmeError::Crypto(err) => write!(f, "Cryptographic error: {}", err),
             AcmeError::Invalid(err) => write!(f, "Invalid request: {}", err),
+            AcmeError::NotDue(err) => write!(f, "{}", err),
             AcmeError::AuthInvalid(status) => write!(f, "Authentication failed: {:?}", status),
             AcmeError::OrderTimeout { .. } => write!(f, "Order processing timed out"),
             AcmeError::OrderInvalid(reason) => write!(f, "Order is invalid: {}", reason),

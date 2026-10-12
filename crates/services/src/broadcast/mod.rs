@@ -107,6 +107,16 @@ impl BroadcastBatch<Vec<BroadcastEvent>> {
                             CacheInvalidation::List(id) => (7u8, *id),
                             CacheInvalidation::DomainLogo(id) => (8u8, *id),
                             CacheInvalidation::TenantLogo(id) => (9u8, *id),
+                            CacheInvalidation::EmailNegative {
+                                domain_id,
+                                local_part_hash,
+                            } => {
+                                serialized.push(10u8);
+                                let _ = serialized.write_leb128(*domain_id);
+                                let _ = serialized.write_leb128(*local_part_hash);
+                                continue;
+                            }
+                            CacheInvalidation::DomainNegative => (11u8, 0),
                         };
 
                         serialized.push(marker);
@@ -125,6 +135,9 @@ impl BroadcastBatch<Vec<BroadcastEvent>> {
                     } else {
                         serialized.push(11u8);
                     }
+                }
+                BroadcastEvent::QueueRefresh => {
+                    serialized.push(12u8);
                 }
             }
         }
@@ -240,6 +253,15 @@ where
                             7 => CacheInvalidation::List(id),
                             8 => CacheInvalidation::DomainLogo(id),
                             9 => CacheInvalidation::TenantLogo(id),
+                            10 => {
+                                let local_part_hash =
+                                    self.messages.next_leb128::<u32>().ok_or(())?;
+                                CacheInvalidation::EmailNegative {
+                                    domain_id: id,
+                                    local_part_hash,
+                                }
+                            }
+                            11 => CacheInvalidation::DomainNegative,
                             _ => return Err(()),
                         });
                     }
@@ -249,6 +271,7 @@ where
                 9 => Ok(Some(BroadcastEvent::CacheInvalidateNegative)),
                 10 => Ok(Some(BroadcastEvent::MtaQueueStatus { is_running: true })),
                 11 => Ok(Some(BroadcastEvent::MtaQueueStatus { is_running: false })),
+                12 => Ok(Some(BroadcastEvent::QueueRefresh)),
                 _ => Err(()),
             }
         } else {

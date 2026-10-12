@@ -9,7 +9,7 @@ use crate::{
     TinyCalendarPreferences,
 };
 use std::hash::{Hash, Hasher};
-use store::rand::{Rng, distr::Alphanumeric};
+use store::rand::{RngExt, distr::Alphanumeric};
 use types::acl::AclGrant;
 
 const SCHEDULE_INBOX_ID: u32 = u32::MAX - 1;
@@ -159,6 +159,40 @@ impl DavResources {
         } else {
             format!("{}{}", self.base_path, resource.path.path)
         }
+    }
+
+    pub fn format_resource_paths_by_id(
+        &self,
+        document_id: u32,
+    ) -> impl Iterator<Item = String> + '_ {
+        self.paths
+            .iter()
+            .filter(move |path| self.resources[path.resource_idx].document_id == document_id)
+            .map(move |path| {
+                self.format_resource(DavResourcePath {
+                    path,
+                    resource: &self.resources[path.resource_idx],
+                })
+            })
+    }
+
+    pub fn format_resource_path_by_parent(
+        &self,
+        document_id: u32,
+        parent_id: u32,
+    ) -> Option<String> {
+        self.paths
+            .iter()
+            .find(|path| {
+                self.resources[path.resource_idx].document_id == document_id
+                    && path.parent_id == Some(parent_id)
+            })
+            .map(|path| {
+                self.format_resource(DavResourcePath {
+                    path,
+                    resource: &self.resources[path.resource_idx],
+                })
+            })
     }
 
     pub fn format_collection(&self, name: &str) -> String {

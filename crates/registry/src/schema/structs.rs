@@ -57,6 +57,10 @@ pub struct AcmeProvider {
     pub max_retries: i64,
     #[serde(rename = "memberTenantId")]
     pub member_tenant_id: Option<Id>,
+    #[serde(rename = "preferredChain")]
+    pub preferred_chain: Option<String>,
+    #[serde(rename = "reuseKey")]
+    pub reuse_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +92,8 @@ pub struct AddressBook {
     pub max_address_books: Option<u64>,
     #[serde(rename = "maxContacts")]
     pub max_contacts: Option<u64>,
+    #[serde(rename = "vCardVersion")]
+    pub v_card_version: VCardVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +230,8 @@ pub struct Application {
     pub auto_update_frequency: Duration,
     #[serde(rename = "unpackDirectory")]
     pub unpack_directory: Option<String>,
+    #[serde(rename = "oauthClientId")]
+    pub oauth_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,6 +792,7 @@ pub enum Coordinator {
     Zenoh(ZenohCoordinator),
     Redis(RedisStore),
     RedisCluster(RedisClusterStore),
+    RedisSentinel(RedisSentinelStore),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -964,6 +973,27 @@ pub struct Dkim1Signature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dkim2Signature {
+    #[serde(rename = "flags")]
+    pub flags: Map<Dkim2Flag>,
+    #[serde(rename = "privateKey")]
+    pub private_key: SecretText,
+    #[serde(rename = "domainId")]
+    pub domain_id: Id,
+    #[serde(rename = "memberTenantId")]
+    pub member_tenant_id: Option<Id>,
+    #[serde(rename = "selector")]
+    pub selector: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: UTCDateTime,
+    #[serde(rename = "nextTransitionAt")]
+    pub next_transition_at: Option<UTCDateTime>,
+    #[serde(rename = "stage")]
+    pub stage: DkimRotationStage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "@type")]
 pub enum DkimManagement {
     Automatic(DkimManagementProperties),
@@ -1005,6 +1035,8 @@ pub struct DkimReportSettings {
 pub enum DkimSignature {
     Dkim1Ed25519Sha256(Dkim1Signature),
     Dkim1RsaSha256(Dkim1Signature),
+    Dkim2Ed25519Sha256(Dkim2Signature),
+    Dkim2RsaSha256(Dkim2Signature),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,6 +1145,12 @@ pub struct DmarcReport {
     pub records: List<DmarcReportRecord>,
     #[serde(rename = "extensions")]
     pub extensions: List<DmarcExtension>,
+    #[serde(rename = "generator")]
+    pub generator: Option<String>,
+    #[serde(rename = "policyNp")]
+    pub policy_np: DmarcDisposition,
+    #[serde(rename = "policyDiscoveryMethod")]
+    pub policy_discovery_method: DmarcDiscovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1197,6 +1235,8 @@ pub struct DmarcTroubleshoot {
     pub ehlo_domain: String,
     #[serde(rename = "mailFrom")]
     pub mail_from: String,
+    #[serde(rename = "to")]
+    pub to: Map<String>,
     #[serde(rename = "message")]
     pub message: Option<String>,
     #[serde(rename = "spfEhloDomain")]
@@ -1215,6 +1255,10 @@ pub struct DmarcTroubleshoot {
     pub dkim_results: List<DmarcTroubleshootAuthResult>,
     #[serde(rename = "dkimPass")]
     pub dkim_pass: bool,
+    #[serde(rename = "dkim2Result")]
+    pub dkim2_result: DmarcTroubleshootAuthResult,
+    #[serde(rename = "dkim2Pass")]
+    pub dkim2_pass: bool,
     #[serde(rename = "arcResult")]
     pub arc_result: DmarcTroubleshootAuthResult,
     #[serde(rename = "dmarcResult")]
@@ -1413,6 +1457,7 @@ pub enum DnsServer {
     Vultr(DnsServerCloud),
     WebSupport(DnsServerWebSupport),
     YandexCloud(DnsServerYandexCloud),
+    PowerDns(DnsServerPowerDns),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1628,6 +1673,7 @@ pub enum DnsServerBootstrap {
     Vultr(DnsServerCloud),
     WebSupport(DnsServerWebSupport),
     YandexCloud(DnsServerYandexCloud),
+    PowerDns(DnsServerPowerDns),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2393,6 +2439,31 @@ pub struct DnsServerPorkbun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DnsServerPowerDns {
+    #[serde(rename = "apiKey")]
+    pub api_key: SecretKey,
+    #[serde(rename = "endpoint")]
+    pub endpoint: Option<String>,
+    #[serde(rename = "serverId")]
+    pub server_id: Option<String>,
+    #[serde(rename = "description")]
+    pub description: String,
+    #[serde(rename = "memberTenantId")]
+    pub member_tenant_id: Option<Id>,
+    #[serde(rename = "timeout")]
+    pub timeout: Duration,
+    #[serde(rename = "ttl")]
+    pub ttl: Duration,
+    #[serde(rename = "pollingInterval")]
+    pub polling_interval: Duration,
+    #[serde(rename = "propagationTimeout")]
+    pub propagation_timeout: Duration,
+    #[serde(rename = "propagationDelay")]
+    pub propagation_delay: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DnsServerRoute53 {
     #[serde(rename = "accessKeyId")]
     pub access_key_id: String,
@@ -2682,6 +2753,8 @@ pub struct Domain {
     pub allow_relaying: bool,
     #[serde(rename = "reportAddressUri")]
     pub report_address_uri: Option<String>,
+    #[serde(rename = "allowScimProvisioning")]
+    pub allow_scim_provisioning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2781,6 +2854,8 @@ pub enum EncryptionAtRest {
     Disabled,
     Aes128(EncryptionSettings),
     Aes256(EncryptionSettings),
+    Aes256Gcm(EncryptionSettings),
+    ChaCha20Poly1305(EncryptionSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2909,6 +2984,8 @@ pub struct GroupAccount {
     pub locale: Locale,
     #[serde(rename = "timeZone")]
     pub time_zone: Option<TimeZone>,
+    #[serde(rename = "externalId")]
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2928,6 +3005,8 @@ pub struct Http {
     pub response_headers: VecMap<String, String>,
     #[serde(rename = "useXForwarded")]
     pub use_x_forwarded: bool,
+    #[serde(rename = "redirectRoot")]
+    pub redirect_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3058,6 +3137,14 @@ pub struct Imap {
     pub timeout_authenticated: Duration,
     #[serde(rename = "timeoutIdle")]
     pub timeout_idle: Duration,
+    #[serde(rename = "maxMessagesPerCommand")]
+    pub max_messages_per_command: u64,
+    #[serde(rename = "minUidBatchSize")]
+    pub min_uid_batch_size: u64,
+    #[serde(rename = "maxUidBatches")]
+    pub max_uid_batches: u64,
+    #[serde(rename = "maxMessagesPerSave")]
+    pub max_messages_per_save: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3067,6 +3154,7 @@ pub enum InMemoryStore {
     Sharded(ShardedInMemoryStore),
     Redis(RedisStore),
     RedisCluster(RedisClusterStore),
+    RedisSentinel(RedisSentinelStore),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3074,6 +3162,7 @@ pub enum InMemoryStore {
 pub enum InMemoryStoreBase {
     Redis(RedisStore),
     RedisCluster(RedisClusterStore),
+    RedisSentinel(RedisSentinelStore),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3135,6 +3224,12 @@ pub struct Jmap {
     pub websocket_timeout: Duration,
     #[serde(rename = "maxSubscriptions")]
     pub max_subscriptions: Option<u64>,
+    #[serde(rename = "webPushKey")]
+    pub web_push_key: SecretTextOptional,
+    #[serde(rename = "webPushContact")]
+    pub web_push_contact: Option<String>,
+    #[serde(rename = "maxPushSize")]
+    pub max_push_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3250,6 +3345,7 @@ pub enum LookupStore {
     Sharded(ShardedInMemoryStore),
     Redis(RedisStore),
     RedisCluster(RedisClusterStore),
+    RedisSentinel(RedisSentinelStore),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4183,6 +4279,22 @@ pub struct PublicKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "@type")]
+pub enum PublicStringOptional {
+    None,
+    Value(PublicStringValue),
+    EnvironmentVariable(SecretKeyEnvironmentVariable),
+    File(SecretKeyFile),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PublicStringValue {
+    #[serde(rename = "value")]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
 pub enum PublicText {
     Text(PublicTextValue),
     EnvironmentVariable(SecretKeyEnvironmentVariable),
@@ -4320,6 +4432,35 @@ pub struct RedisClusterStore {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct RedisSentinelStore {
+    #[serde(rename = "urls")]
+    pub urls: Map<String>,
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    #[serde(rename = "timeout")]
+    pub timeout: Duration,
+    #[serde(rename = "authUsername")]
+    pub auth_username: Option<String>,
+    #[serde(rename = "authSecret")]
+    pub auth_secret: SecretKeyOptional,
+    #[serde(rename = "sentinelUsername")]
+    pub sentinel_username: Option<String>,
+    #[serde(rename = "sentinelSecret")]
+    pub sentinel_secret: SecretKeyOptional,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: RedisProtocol,
+    #[serde(rename = "poolMaxConnections")]
+    pub pool_max_connections: u64,
+    #[serde(rename = "poolTimeoutCreate")]
+    pub pool_timeout_create: Option<Duration>,
+    #[serde(rename = "poolTimeoutWait")]
+    pub pool_timeout_wait: Option<Duration>,
+    #[serde(rename = "poolTimeoutRecycle")]
+    pub pool_timeout_recycle: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RedisStore {
     #[serde(rename = "url")]
     pub url: String,
@@ -4346,6 +4487,8 @@ pub struct ReportSettings {
     pub outbound_report_domain: Option<String>,
     #[serde(rename = "outboundReportSubmitter")]
     pub outbound_report_submitter: Expression,
+    #[serde(rename = "inboundReportMaxSize")]
+    pub inbound_report_max_size: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4359,6 +4502,8 @@ pub struct RocksDbStore {
     pub buffer_size: u64,
     #[serde(rename = "poolWorkers")]
     pub pool_workers: Option<u64>,
+    #[serde(rename = "cacheSize")]
+    pub cache_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4391,7 +4536,7 @@ pub struct S3Store {
     #[serde(rename = "bucket")]
     pub bucket: String,
     #[serde(rename = "accessKey")]
-    pub access_key: Option<String>,
+    pub access_key: PublicStringOptional,
     #[serde(rename = "secretKey")]
     pub secret_key: SecretKeyOptional,
     #[serde(rename = "securityToken")]
@@ -4774,6 +4919,8 @@ pub struct SieveUserInterpreter {
     pub max_var_size: u64,
     #[serde(rename = "maxScripts")]
     pub max_scripts: Option<u64>,
+    #[serde(rename = "dkimSignDomain")]
+    pub dkim_sign_domain: Expression,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6097,6 +6244,8 @@ pub struct UserAccount {
     pub quotas: VecMap<StorageQuota, u64>,
     #[serde(rename = "aliases")]
     pub aliases: List<EmailAlias>,
+    #[serde(rename = "externalId")]
+    pub external_id: Option<String>,
     #[serde(rename = "description")]
     pub description: Option<String>,
     #[serde(rename = "locale")]

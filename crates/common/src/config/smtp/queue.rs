@@ -171,7 +171,7 @@ pub struct QueueQuotas {
 #[derive(Clone)]
 pub struct QueueQuota {
     pub id: ObjectId,
-    pub expr: Expression,
+    pub expr: IfBlock,
     pub keys: u16,
     pub size: Option<u64>,
     pub messages: Option<u64>,
@@ -393,14 +393,13 @@ impl QueueConfig {
                                 enums::MtaProtocol::Smtp => ServerProtocol::Smtp,
                                 enums::MtaProtocol::Lmtp => ServerProtocol::Lmtp,
                             },
-                            auth: route
-                                .auth_username
-                                .and_then(|user| secret.map(|secret| (user, secret)))
-                                .map(|(user, secret)| Credentials::Basic {
+                            auth: route.auth_username.zip(secret).map(|(user, secret)| {
+                                Credentials::Basic {
                                     username: user,
                                     secret: secret.into_owned(),
                                     mfa_token: None,
-                                }),
+                                }
+                            }),
                             tls_implicit: route.implicit_tls,
                             tls_allow_invalid_certs: route.allow_invalid_certs,
                         }),
@@ -455,7 +454,7 @@ impl QueueRateLimiters {
             }
 
             let limiter = QueueRateLimiter {
-                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()).default,
+                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()),
                 id: obj.id,
                 keys: obj
                     .object
@@ -477,7 +476,7 @@ impl QueueRateLimiters {
             };
 
             if (limiter.keys & (THROTTLE_RCPT | THROTTLE_RCPT_DOMAIN)) != 0
-                || limiter.expr.items().iter().any(|c| {
+                || limiter.expr.all_items().any(|c| {
                     matches!(
                         c,
                         ExpressionItem::Variable(
@@ -493,7 +492,7 @@ impl QueueRateLimiters {
                     | THROTTLE_HELO_DOMAIN
                     | THROTTLE_AUTH_AS))
                 != 0
-                || limiter.expr.items().iter().any(|c| {
+                || limiter.expr.all_items().any(|c| {
                     matches!(
                         c,
                         ExpressionItem::Variable(
@@ -524,7 +523,7 @@ impl QueueRateLimiters {
             }
 
             let limiter = QueueRateLimiter {
-                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()).default,
+                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()),
                 id: obj.id,
                 keys: obj
                     .object
@@ -542,7 +541,7 @@ impl QueueRateLimiters {
                 rate: obj.object.rate,
             };
             if (limiter.keys & (THROTTLE_MX | THROTTLE_REMOTE_IP | THROTTLE_LOCAL_IP)) != 0
-                || limiter.expr.items().iter().any(|c| {
+                || limiter.expr.all_items().any(|c| {
                     matches!(
                         c,
                         ExpressionItem::Variable(
@@ -557,8 +556,7 @@ impl QueueRateLimiters {
             } else if (limiter.keys & (THROTTLE_RCPT_DOMAIN)) != 0
                 || limiter
                     .expr
-                    .items()
-                    .iter()
+                    .all_items()
                     .any(|c| matches!(c, ExpressionItem::Variable(ExpressionVariable::RcptDomain)))
             {
                 throttle.rcpt.push(limiter);
@@ -585,7 +583,7 @@ impl QueueQuotas {
             }
 
             let quota = QueueQuota {
-                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()).default,
+                expr: bp.compile_expr(obj.id, &obj.object.ctx_match_()),
                 id: obj.id,
                 keys: obj
                     .object
@@ -605,16 +603,14 @@ impl QueueQuotas {
             if (quota.keys & THROTTLE_RCPT) != 0
                 || quota
                     .expr
-                    .items()
-                    .iter()
+                    .all_items()
                     .any(|c| matches!(c, ExpressionItem::Variable(ExpressionVariable::Rcpt)))
             {
                 capacities.rcpt.push(quota);
             } else if (quota.keys & THROTTLE_RCPT_DOMAIN) != 0
                 || quota
                     .expr
-                    .items()
-                    .iter()
+                    .all_items()
                     .any(|c| matches!(c, ExpressionItem::Variable(ExpressionVariable::RcptDomain)))
             {
                 capacities.rcpt_domain.push(quota);

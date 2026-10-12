@@ -51,6 +51,9 @@ impl Server {
                         let Some(key) = self.registry().object::<DkimSignature>(id).await? else {
                             continue;
                         };
+                        if !key.is_published() {
+                            continue;
+                        }
                         records.push(generate_dkim_dns_record(&key, domain_name).await?);
                     }
                 }
@@ -59,11 +62,10 @@ impl Server {
                         records.push(NamedDnsRecord {
                             name: format!("{domain_name}."),
                             record: DnsRecord::MX(MXRecord {
-                                exchange: mx
-                                    .hostname
-                                    .as_deref()
-                                    .unwrap_or(default_host)
-                                    .to_string(),
+                                exchange: format!(
+                                    "{}.",
+                                    mx.hostname.as_deref().unwrap_or(default_host)
+                                ),
                                 priority: mx.priority as u16,
                             }),
                         });
@@ -133,7 +135,7 @@ impl Server {
                     }
                 }
                 DnsRecordType::AutoConfig => {
-                    let pacc_digest = Sha256::digest(&self.get_pacc_for_fomain(domain_name).await?);
+                    let pacc_digest = Sha256::digest(&self.get_pacc_for_domain(domain_name).await?);
                     let pacc_digest_encoded = general_purpose::STANDARD.encode(pacc_digest);
 
                     records.push(NamedDnsRecord {
@@ -379,7 +381,7 @@ impl Server {
         .map(|records| BindSerializer::serialize(&records))
     }
 
-    pub async fn get_pacc_for_fomain(&self, domain_name: &str) -> trc::Result<String> {
+    pub async fn get_pacc_for_domain(&self, domain_name: &str) -> trc::Result<String> {
         self.get_directory_for_domain(domain_name)
             .await
             .caused_by(trc::location!())

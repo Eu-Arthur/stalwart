@@ -16,16 +16,18 @@ use crate::{
     },
 };
 use common::{
+    Server,
     auth::{
-        AccessToken, Permissions, PermissionsGroup,
+        AccessToken, Permissions,
         credential::{ApiKey, AppPassword},
         permissions::BuildPermissions,
     },
     cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
+    storage::encryption::{EncryptionMethod, parse_public_key},
 };
 use directory::core::secret::{SecretVerificationResult, hash_secret, verify_mfa_secret_hash};
-use jmap_proto::{error::set::SetError, types::state::State};
+use jmap_proto::{error::set::SetError, request::MaybeInvalid, types::state::State};
 use jmap_tools::{JsonPointer, JsonPointerItem, Key, Map, Value};
 use registry::{
     jmap::{IntoValue, JsonPointerPatch, MaybeUnpatched, RegistryJsonPatch, RegistryValue},
@@ -33,8 +35,8 @@ use registry::{
         enums::{CredentialType, StorageQuota},
         prelude::{MASKED_PASSWORD, Object, ObjectInner, ObjectType, Property},
         structs::{
-            Account, AccountPassword, AccountSettings, Credential, CredentialPermissions, OtpAuth,
-            SecondaryCredential,
+            Account, AccountPassword, AccountSettings, Credential, CredentialPermissions,
+            EncryptionAtRest, OtpAuth, PublicKey, SecondaryCredential,
         },
     },
     types::{datetime::UTCDateTime, id::ObjectId},
@@ -103,6 +105,22 @@ pub(crate) async fn account_set(
                         );
                         break 'outer;
                     }
+                }
+
+                if account.encryption_at_rest != old_account.encryption_at_rest
+                    && let Some(algorithm) =
+                        unsupported_pgp_algorithm(set.server, &account.encryption_at_rest).await?
+                {
+                    account = old_account.clone();
+                    set.response.not_updated.append(
+                        id,
+                        SetError::invalid_properties()
+                            .with_property(Property::EncryptionAtRest)
+                            .with_description(format!(
+                                "{algorithm} is only supported for S/MIME encryption, but the selected public key is an OpenPGP key."
+                            )),
+                    );
+                    break 'outer;
                 }
 
                 set.response.updated.append(id, None);
@@ -565,6 +583,17 @@ pub(crate) async fn account_set(
                         _ => {}
                     }
 
+                    if let Credential::AppPassword(new_sc) | Credential::ApiKey(new_sc) =
+                        &credential
+                        && let Credential::AppPassword(old_sc) | Credential::ApiKey(old_sc) =
+                            &*old_credential
+                        && old_sc.permissions != new_sc.permissions
+                        && let Err(err) = validate_credential_permissions(set.access_token, new_sc)
+                    {
+                        set.response.not_updated.append(id, err);
+                        continue 'outer;
+                    }
+
                     *old_credential = credential;
 
                     set.response.updated.append(id, None);
@@ -646,13 +675,13 @@ pub(crate) async fn account_set(
                     .response
                     .updated
                     .into_keys()
-                    .map(|id| (id, err.clone()))
+                    .map(|id| (MaybeInvalid::Value(id), err.clone()))
                     .collect::<Vec<_>>();
                 let failed_delete = set
                     .response
                     .destroyed
                     .into_iter()
-                    .map(|id| (id, err.clone()))
+                    .map(|id| (MaybeInvalid::Value(id), err.clone()))
                     .collect::<Vec<_>>();
 
                 set.response.not_created.extend(failed_create);
@@ -706,7 +735,7 @@ pub(crate) async fn account_get(
                 }
             }
 
-            get.response.not_found.extend(ids);
+            get.response.not_found.extend(ids.map(MaybeInvalid::Value));
         }
         ObjectType::AccountPassword => {
             let mut ids = get
@@ -747,7 +776,7 @@ pub(crate) async fn account_get(
                 }
             }
 
-            get.response.not_found.extend(ids);
+            get.response.not_found.extend(ids.map(MaybeInvalid::Value));
         }
         ObjectType::ApiKey | ObjectType::AppPassword => {
             let mut ids = if let Some(ids) = get.ids.take() {
@@ -897,21 +926,49 @@ pub(crate) async fn credential_query(
     Ok(response)
 }
 
+async fn unsupported_pgp_algorithm(
+    server: &Server,
+    encryption_at_rest: &EncryptionAtRest,
+) -> trc::Result<Option<&'static str>> {
+    let (settings, algorithm) = match encryption_at_rest {
+        EncryptionAtRest::Aes256Gcm(settings) => (settings, "AES-256-GCM"),
+        EncryptionAtRest::ChaCha20Poly1305(settings) => (settings, "ChaCha20-Poly1305"),
+        _ => return Ok(None),
+    };
+
+    if let Some(public_key) = server
+        .registry()
+        .object::<PublicKey>(settings.public_key)
+        .await
+        .caused_by(trc::location!())?
+        && matches!(
+            parse_public_key(&public_key),
+            Ok(Some(params)) if params.method == EncryptionMethod::PGP
+        )
+    {
+        Ok(Some(algorithm))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) fn validate_credential_permissions(
     access_token: &AccessToken,
     credential: &SecondaryCredential,
 ) -> Result<(), SetError<Property>> {
-    match &credential.permissions {
-        CredentialPermissions::Inherit | CredentialPermissions::Disable(_) => Ok(()),
-        CredentialPermissions::Replace(permissions) => access_token
-            .can_grant_permissions(
-                PermissionsGroup {
-                    enabled: Permissions::from_permission(permissions.permissions.as_slice()),
-                    disabled: Default::default(),
-                    merge: false,
-                }
-                .finalize(),
-            )
-            .map_err(build_set_error),
-    }
+    let effective = match &credential.permissions {
+        CredentialPermissions::Inherit => access_token.account_permissions().clone(),
+        CredentialPermissions::Disable(list) => {
+            let mut effective = access_token.account_permissions().clone();
+            effective.clear_many(&Permissions::from_permission(list.permissions.as_slice()));
+            effective
+        }
+        CredentialPermissions::Replace(list) => {
+            Permissions::from_permission(list.permissions.as_slice())
+        }
+    };
+
+    access_token
+        .can_grant_permissions(effective)
+        .map_err(build_set_error)
 }

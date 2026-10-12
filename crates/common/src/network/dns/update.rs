@@ -217,6 +217,7 @@ impl DnsUpdater {
                     region: Some(server.region),
                     hosted_zone_id: server.hosted_zone_id,
                     private_zone_only: Some(server.private_zone_only),
+                    endpoint: None,
                 };
                 Ok(DnsUpdater {
                     polling_interval: server.polling_interval.into_inner(),
@@ -704,7 +705,6 @@ impl DnsUpdater {
             }),
             DnsServer::Inwx(server) => {
                 let password = server.password.secret().await?.into_owned();
-                let shared_secret = server.shared_secret.secret().await?.map(|c| c.into_owned());
                 Ok(DnsUpdater {
                     polling_interval: server.polling_interval.into_inner(),
                     propagation_timeout: server.propagation_timeout.into_inner(),
@@ -714,7 +714,6 @@ impl DnsUpdater {
                     updater: dns_update::DnsUpdater::new_inwx(
                         server.username,
                         password,
-                        shared_secret,
                         server.sandbox,
                         server.timeout.into_inner().into(),
                     )
@@ -962,6 +961,20 @@ impl DnsUpdater {
                 )
                 .map_err(|err| format!("Failed to build DNS updater: {}", err))?,
             }),
+            DnsServer::PowerDns(server) => Ok(DnsUpdater {
+                polling_interval: server.polling_interval.into_inner(),
+                propagation_timeout: server.propagation_timeout.into_inner(),
+                propagation_delay: server.propagation_delay.map(|d| d.into_inner()),
+                ttl: server.ttl.into_inner(),
+                core,
+                updater: dns_update::DnsUpdater::new_pdns(
+                    server.api_key.secret().await?,
+                    server.endpoint,
+                    server.server_id,
+                    server.timeout.into_inner().into(),
+                )
+                .map_err(|err| format!("Failed to build DNS updater: {}", err))?,
+            }),
             DnsServer::Safedns(server) => Ok(DnsUpdater {
                 polling_interval: server.polling_interval.into_inner(),
                 propagation_timeout: server.propagation_timeout.into_inner(),
@@ -1014,6 +1027,7 @@ impl DnsUpdater {
                 updater: dns_update::DnsUpdater::new_transip(
                     server.username.as_str(),
                     server.private_key_pem.secret().await?,
+                    true,
                     server.timeout.into_inner().into(),
                 )
                 .map_err(|err| format!("Failed to build DNS updater: {}", err))?,
@@ -1114,125 +1128,134 @@ impl DnsUpdater {
         }
     }
 
-    pub async fn create(
+    pub async fn set_rrset(
         &self,
         origin: &str,
         name: &str,
-        record: DnsRecord,
-        verify: bool,
-        delete_before_create: bool,
-    ) -> Result<bool, String> {
-        // First try deleting the record
-        if delete_before_create
-            && let Err(err) = self.updater.delete(name, origin, record.as_type()).await
-        {
-            // Errors are expected if the record does not exist
-            trc::event!(
-                Dns(DnsEvent::RecordDeletionFailed),
-                Hostname = name.to_string(),
-                Reason = err.to_string(),
-                Details = origin.to_string(),
-                Type = record.as_type().as_str(),
-            );
-        }
+        record_type: DnsRecordType,
+        records: Vec<DnsRecord>,
+    ) -> Result<(), String> {
+        let record_values = records
+            .iter()
+            .map(|r| trc::Value::String(r.to_string().into()))
+            .collect::<Vec<_>>();
 
-        // Create the record
         if let Err(err) = self
             .updater
-            .create(name, record.clone(), self.ttl.as_secs() as u32, origin)
+            .set_rrset(
+                name,
+                record_type,
+                self.ttl.as_secs() as u32,
+                records,
+                origin,
+            )
             .await
         {
-            return Err(format!("Failed to create DNS record: {}", err));
+            return Err(format!("Failed to set DNS RRSet: {}", err));
         }
 
         trc::event!(
             Dns(DnsEvent::RecordCreated),
             Hostname = name.to_string(),
             Details = origin.to_string(),
-            Type = record.as_type().as_str(),
-            Value = record.to_string(),
+            Type = record_type.as_str(),
+            Value = record_values,
         );
-
-        if verify && let DnsRecord::TXT(txt_record) = &record {
-            #[cfg(feature = "test_mode")]
-            if matches!(
-                self.updater,
-                dns_update::DnsUpdater::Pebble(_) | dns_update::DnsUpdater::InMemory(_)
-            ) {
-                return Ok(true);
-            }
-
-            // Wait for changes to propagate
-            if let Some(initial_wait) = self.propagation_delay {
-                tokio::time::sleep(initial_wait).await;
-            }
-            let wait_until = Instant::now() + self.propagation_timeout;
-            let mut did_propagate = false;
-            while Instant::now() < wait_until {
-                match self.core.smtp.resolvers.dns.txt_raw_lookup(&name).await {
-                    Ok(result) => {
-                        let result = std::str::from_utf8(&result).unwrap_or_default();
-                        if result.contains(txt_record) {
-                            did_propagate = true;
-                            break;
-                        } else {
-                            trc::event!(
-                                Dns(DnsEvent::RecordNotPropagated),
-                                Hostname = name.to_string(),
-                                Details = origin.to_string(),
-                                Result = result.to_string(),
-                                Type = record.as_type().as_str(),
-                                Value = record.to_string(),
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        trc::event!(
-                            Dns(DnsEvent::RecordLookupFailed),
-                            Hostname = name.to_string(),
-                            Details = origin.to_string(),
-                            Reason = err.to_string(),
-                            Type = record.as_type().as_str(),
-                            Value = record.to_string(),
-                        );
-                    }
-                }
-
-                tokio::time::sleep(self.polling_interval).await;
-            }
-
-            if did_propagate {
-                trc::event!(
-                    Dns(DnsEvent::RecordPropagated),
-                    Hostname = name.to_string(),
-                    Details = origin.to_string(),
-                    Type = record.as_type().as_str(),
-                    Value = record.to_string(),
-                );
-            } else {
-                trc::event!(
-                    Dns(DnsEvent::RecordPropagationTimeout),
-                    Hostname = name.to_string(),
-                    Details = origin.to_string(),
-                    Type = record.as_type().as_str(),
-                    Value = record.to_string(),
-                );
-            }
-
-            Ok(did_propagate)
-        } else {
-            Ok(true)
-        }
+        Ok(())
     }
 
-    pub async fn delete(
+    pub async fn delete_rrset(
         &self,
         origin: &str,
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<(), String> {
-        // First try deleting the record
-        match self.updater.delete(name, origin, record_type).await {
+        if let Err(err) = self
+            .updater
+            .set_rrset(
+                name,
+                record_type,
+                self.ttl.as_secs() as u32,
+                Vec::new(),
+                origin,
+            )
+            .await
+        {
+            trc::event!(
+                Dns(DnsEvent::RecordDeletionFailed),
+                Hostname = name.to_string(),
+                Details = origin.to_string(),
+                Type = record_type.as_str(),
+                Reason = err.to_string(),
+            );
+            return Err(format!("Failed to delete DNS RRSet: {}", err));
+        }
+
+        Ok(())
+    }
+
+    pub async fn add_to_rrset(
+        &self,
+        origin: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        records: Vec<DnsRecord>,
+    ) -> Result<(), String> {
+        let record_values = records
+            .iter()
+            .map(|r| trc::Value::String(r.to_string().into()))
+            .collect::<Vec<_>>();
+
+        if let Err(err) = self
+            .updater
+            .add_to_rrset(
+                name,
+                record_type,
+                self.ttl.as_secs() as u32,
+                records,
+                origin,
+            )
+            .await
+        {
+            return Err(format!("Failed to add to DNS RRSet: {}", err));
+        }
+
+        trc::event!(
+            Dns(DnsEvent::RecordCreated),
+            Hostname = name.to_string(),
+            Details = origin.to_string(),
+            Type = record_type.as_str(),
+            Value = record_values,
+        );
+        Ok(())
+    }
+
+    pub async fn list_rrset(
+        &self,
+        origin: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> dns_update::Result<Vec<DnsRecord>> {
+        self.updater.list_rrset(name, record_type, origin).await
+    }
+
+    pub async fn remove_from_rrset(
+        &self,
+        origin: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        records: Vec<DnsRecord>,
+    ) -> Result<(), String> {
+        let record_values = records
+            .iter()
+            .map(|r| trc::Value::String(r.to_string().into()))
+            .collect::<Vec<_>>();
+
+        match self
+            .updater
+            .remove_from_rrset(name, record_type, records, origin)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(err) => {
                 trc::event!(
@@ -1241,10 +1264,78 @@ impl DnsUpdater {
                     Reason = err.to_string(),
                     Details = origin.to_string(),
                     Type = record_type.as_str(),
+                    Value = record_values,
                 );
                 Err(err.to_string())
             }
         }
+    }
+
+    pub async fn wait_for_txt_propagation(&self, name: &str, origin: &str, expected: &str) -> bool {
+        #[cfg(feature = "test_mode")]
+        if matches!(
+            self.updater,
+            dns_update::DnsUpdater::Pebble(_) | dns_update::DnsUpdater::InMemory(_)
+        ) {
+            return true;
+        }
+
+        if let Some(initial_wait) = self.propagation_delay {
+            tokio::time::sleep(initial_wait).await;
+        }
+        let wait_until = Instant::now() + self.propagation_timeout;
+        let mut did_propagate = false;
+        while Instant::now() < wait_until {
+            match self.core.smtp.resolvers.dns.txt_raw_lookup(&name).await {
+                Ok(result) => {
+                    let result = std::str::from_utf8(&result).unwrap_or_default();
+                    if result.contains(expected) {
+                        did_propagate = true;
+                        break;
+                    } else {
+                        trc::event!(
+                            Dns(DnsEvent::RecordNotPropagated),
+                            Hostname = name.to_string(),
+                            Details = origin.to_string(),
+                            Result = result.to_string(),
+                            Type = DnsRecordType::TXT.as_str(),
+                            Value = expected.to_string(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    trc::event!(
+                        Dns(DnsEvent::RecordLookupFailed),
+                        Hostname = name.to_string(),
+                        Details = origin.to_string(),
+                        Reason = err.to_string(),
+                        Type = DnsRecordType::TXT.as_str(),
+                        Value = expected.to_string(),
+                    );
+                }
+            }
+
+            tokio::time::sleep(self.polling_interval).await;
+        }
+
+        if did_propagate {
+            trc::event!(
+                Dns(DnsEvent::RecordPropagated),
+                Hostname = name.to_string(),
+                Details = origin.to_string(),
+                Type = DnsRecordType::TXT.as_str(),
+                Value = expected.to_string(),
+            );
+        } else {
+            trc::event!(
+                Dns(DnsEvent::RecordPropagationTimeout),
+                Hostname = name.to_string(),
+                Details = origin.to_string(),
+                Type = DnsRecordType::TXT.as_str(),
+                Value = expected.to_string(),
+            );
+        }
+        did_propagate
     }
 }
 

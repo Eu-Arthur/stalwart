@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use ahash::AHashMap;
 use mail_auth::{
     MessageAuthenticator,
     hickory_resolver::{
@@ -25,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
+    net::IpAddr,
     str::FromStr,
     sync::Arc,
 };
@@ -34,6 +36,7 @@ use utils::cache::CacheItemWeight;
 pub struct Resolvers {
     pub dns: MessageAuthenticator,
     pub dnssec: DnssecResolver,
+    pub dnssec_available: bool,
 }
 
 #[derive(Clone)]
@@ -41,11 +44,18 @@ pub struct DnssecResolver {
     pub resolver: TokioResolver,
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TlsaMatching {
+    Full,
+    Sha256,
+    Sha512,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsaEntry {
     pub is_end_entity: bool,
-    pub is_sha256: bool,
     pub is_spki: bool,
+    pub matching: TlsaMatching,
     pub data: Vec<u8>,
 }
 
@@ -131,6 +141,7 @@ impl Resolvers {
             },
             DnsResolver::Custom(resolver) => {
                 resolver_config = ResolverConfig::default();
+                let mut nameservers: AHashMap<IpAddr, Vec<ConnectionConfig>> = AHashMap::new();
 
                 for server in resolver.servers {
                     let ip = server.address.into_inner();
@@ -144,7 +155,11 @@ impl Resolvers {
                     };
                     let mut connection = ConnectionConfig::new(protocol);
                     connection.port = port;
-                    resolver_config.add_name_server(NameServerConfig::new(ip, true, vec![connection]));
+                    nameservers.entry(ip).or_default().push(connection);
+                }
+
+                for (ip, connections) in nameservers {
+                    resolver_config.add_name_server(NameServerConfig::new(ip, true, connections));
                 }
 
                 opts.num_concurrent_reqs = resolver.concurrency as usize;
@@ -200,24 +215,56 @@ impl Resolvers {
         let mut opts_dnssec = opts.clone();
         opts_dnssec.validate = true;
 
+        let dnssec = DnssecResolver {
+            resolver: TokioResolver::builder_with_config(
+                config_dnssec,
+                TokioRuntimeProvider::default(),
+            )
+            .with_options(opts_dnssec)
+            .build()
+            .expect("Failed to build DNSSEC resolver"),
+        };
+
         Resolvers {
+            #[cfg(not(feature = "test_mode"))]
+            dnssec_available: ensure_dnssec(&resolver_config, &dnssec.resolver).await,
+            #[cfg(feature = "test_mode")]
+            dnssec_available: true,
             dns: MessageAuthenticator::new(resolver_config, opts).unwrap(),
-            dnssec: DnssecResolver {
-                resolver: TokioResolver::builder_with_config(
-                    config_dnssec,
-                    TokioRuntimeProvider::default(),
-                )
-                .with_options(opts_dnssec)
-                .build()
-                .expect("Failed to build DNSSEC resolver"),
-            },
+            dnssec,
         }
     }
+}
+
+#[cfg(not(feature = "test_mode"))]
+async fn ensure_dnssec(config: &ResolverConfig, resolver: &TokioResolver) -> bool {
+    config.name_servers().iter().any(|name_server| {
+        name_server
+            .connections
+            .iter()
+            .any(|connection| !matches!(connection.protocol, ProtocolConfig::Udp))
+    }) && resolver
+        .lookup(
+            hickory_proto::rr::Name::root(),
+            hickory_proto::rr::RecordType::DNSKEY,
+        )
+        .await
+        .is_ok_and(|lookup| {
+            lookup
+                .answers()
+                .iter()
+                .any(|record| record.proof.is_secure())
+        })
 }
 
 impl Policy {
     pub async fn try_parse(bp: &mut Bootstrap) -> Option<Self> {
         let mta = bp.setting_infallible::<MtaSts>().await;
+
+        if matches!(mta.mode, PolicyEnforcement::Disable) {
+            return None;
+        }
+
         let mut mx_hosts = mta.mx_hosts.into_inner();
 
         if mx_hosts.is_empty() {
@@ -308,6 +355,7 @@ impl Default for Resolvers {
                 .build()
                 .expect("Failed to build DNSSEC resolver"),
             },
+            dnssec_available: true,
         }
     }
 }
@@ -319,7 +367,7 @@ impl Display for Policy {
         match self.mode {
             Mode::Enforce => f.write_str("enforce")?,
             Mode::Testing => f.write_str("testing")?,
-            Mode::None => unreachable!(),
+            Mode::None => f.write_str("none")?,
         }
         f.write_str("\r\nmax_age: ")?;
         self.max_age.fmt(f)?;
@@ -352,6 +400,7 @@ impl Clone for Resolvers {
         Self {
             dns: self.dns.clone(),
             dnssec: self.dnssec.clone(),
+            dnssec_available: self.dnssec_available,
         }
     }
 }

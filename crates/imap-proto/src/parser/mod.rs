@@ -24,6 +24,7 @@ pub mod status;
 pub mod store;
 pub mod subscribe;
 pub mod thread;
+pub mod uidbatches;
 
 use std::{borrow::Cow, str::FromStr};
 
@@ -80,6 +81,8 @@ impl CommandParser for Command {
             "ID" => Command::Id,
             "GETQUOTA" => Command::GetQuota,
             "GETQUOTAROOT" => Command::GetQuotaRoot,
+            "GETJMAPACCESS" => Command::GetJmapAccess,
+            "UIDBATCHES" => Command::UidBatches,
         )
     }
 
@@ -413,7 +416,16 @@ impl<T: PartialEq> PushUnique<T> for Vec<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::Sequence;
+    use crate::{Command, protocol::Sequence, receiver::CommandParser};
+
+    #[test]
+    fn parse_command() {
+        assert_eq!(
+            Command::parse(b"GETJMAPACCESS", false),
+            Some(Command::GetJmapAccess)
+        );
+        assert_eq!(Command::parse(b"NOTACOMMAND", false), None);
+    }
 
     #[test]
     fn parse_sequence_set() {

@@ -13,9 +13,12 @@ use common::{
     network::acme::account::acme_create_account, psl,
 };
 use directory::core::secret::hash_secret;
-use jmap_proto::error::set::{SetError, SetErrorType};
+use jmap_proto::{
+    error::set::{SetError, SetErrorType},
+    request::MaybeInvalid,
+};
 use jmap_tools::{JsonPointer, JsonPointerItem, Key};
-use rand::{Rng, distr::Alphanumeric, rng};
+use rand::{RngExt, distr::Alphanumeric, rng};
 use registry::{
     jmap::{IntoValue, JmapValue, JsonPointerPatch, RegistryJsonPatch},
     schema::{
@@ -39,7 +42,7 @@ use store::{
     write::{AnyKey, BatchBuilder},
 };
 use types::id::Id;
-use utils::is_valid_domain;
+use utils::{DomainPart, is_valid_domain};
 
 pub(crate) async fn bootstrap_get(
     mut get: RegistryGetResponse<'_>,
@@ -67,7 +70,7 @@ pub(crate) async fn bootstrap_get(
         }
     }
 
-    get.response.not_found.extend(ids);
+    get.response.not_found.extend(ids.map(MaybeInvalid::Value));
     Ok(get)
 }
 
@@ -75,9 +78,9 @@ pub(crate) async fn bootstrap_set(
     mut set: RegistrySetResponse<'_>,
 ) -> trc::Result<RegistrySetResponse<'_>> {
     if !set.server.registry().is_bootstrap_mode() {
-        set.fail_all_create("This operation is only allowed bootstrap mode");
-        set.fail_all_update("This operation is only allowed bootstrap mode");
-        set.fail_all_destroy("This operation is only allowed bootstrap mode");
+        set.fail_all_create("This operation is only allowed in bootstrap mode");
+        set.fail_all_update("This operation is only allowed in bootstrap mode");
+        set.fail_all_destroy("This operation is only allowed in bootstrap mode");
         return Ok(set);
     }
 
@@ -121,8 +124,20 @@ pub(crate) async fn bootstrap_set(
         }
 
         // Validate domain name and hostname
-        let server_hostname = bootstrap.server_hostname.trim().to_lowercase();
-        let domain_name = bootstrap.default_domain.trim().to_lowercase();
+        let server_hostname = bootstrap
+            .server_hostname
+            .trim()
+            .to_lowercase()
+            .to_ascii_domain()
+            .map(|hostname| hostname.into_owned())
+            .unwrap_or_default();
+        let domain_name = bootstrap
+            .default_domain
+            .trim()
+            .to_lowercase()
+            .to_ascii_domain()
+            .map(|domain| domain.into_owned())
+            .unwrap_or_default();
         if !is_valid_domain(&server_hostname) {
             set.response.not_updated.append(
                 id,
@@ -263,7 +278,8 @@ pub(crate) async fn bootstrap_set(
             }
         }
         let mut bp_check =
-            store::registry::bootstrap::Bootstrap::new_uninitialized(tmp_registry.clone());
+            store::registry::bootstrap::Bootstrap::new_uninitialized(tmp_registry.clone())
+                .with_data_store(store.clone());
         let _ = Storage::parse(&mut bp_check).await;
         if !bp_check.errors.is_empty() {
             set.response
@@ -623,6 +639,7 @@ fn map_dns_server(dns_server: &DnsServerBootstrap) -> Option<registry::schema::s
         DnsServerBootstrap::Ns1(inner) => DnsServer::Ns1(inner.clone()).into(),
         DnsServerBootstrap::OracleCloud(inner) => DnsServer::OracleCloud(inner.clone()).into(),
         DnsServerBootstrap::Plesk(inner) => DnsServer::Plesk(inner.clone()).into(),
+        DnsServerBootstrap::PowerDns(inner) => DnsServer::PowerDns(inner.clone()).into(),
         DnsServerBootstrap::Safedns(inner) => DnsServer::Safedns(inner.clone()).into(),
         DnsServerBootstrap::Scaleway(inner) => DnsServer::Scaleway(inner.clone()).into(),
         DnsServerBootstrap::TencentCloud(inner) => DnsServer::TencentCloud(inner.clone()).into(),
@@ -636,6 +653,14 @@ fn map_dns_server(dns_server: &DnsServerBootstrap) -> Option<registry::schema::s
     }
 }
 
+// FreeBSD keeps variable application data under /var/db (hier(7))
+// rather than FHS /var/lib.
+const DEFAULT_DATA_PATH: &str = if cfg!(target_os = "freebsd") {
+    "/var/db/stalwart/"
+} else {
+    "/var/lib/stalwart/"
+};
+
 fn build_default_bootstrap(server: &Server) -> Bootstrap {
     let server_hostname = server.registry().local_hostname().to_string();
     let default_domain = psl::domain_str(&server_hostname)
@@ -644,7 +669,7 @@ fn build_default_bootstrap(server: &Server) -> Bootstrap {
 
     Bootstrap {
         data_store: DataStore::RocksDb(RocksDbStore {
-            path: "/var/lib/stalwart/".to_string(),
+            path: DEFAULT_DATA_PATH.to_string(),
             ..Default::default()
         }),
         blob_store: BlobStore::Default,

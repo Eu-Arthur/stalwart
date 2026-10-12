@@ -12,7 +12,6 @@ use crate::{
         email::{EmailProperty, EmailValue},
     },
     request::{
-        MaybeInvalid,
         deserialize::{DeserializeArguments, deserialize_request},
         reference::{MaybeIdReference, MaybeResultReference, ResultReference},
     },
@@ -33,7 +32,7 @@ pub struct ImportEmailRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct ImportEmail {
-    pub blob_id: MaybeInvalid<BlobId>,
+    pub blob_id: MaybeIdReference<BlobId>,
     pub mailbox_ids: MaybeResultReference<Vec<MaybeIdReference<Id>>>,
     pub keywords: Vec<Keyword>,
     pub received_at: Option<UTCDate>,
@@ -67,7 +66,7 @@ impl<'de> DeserializeArguments<'de> for ImportEmailRequest {
     {
         hashify::fnc_map!(key.as_bytes(),
             b"accountId" => {
-                self.account_id = map.next_value()?;
+                self.account_id = crate::request::deserialize_account_id(map)?;
             },
             b"ifInState" => {
                 self.if_in_state = map.next_value()?;

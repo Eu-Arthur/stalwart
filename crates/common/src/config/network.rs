@@ -15,9 +15,10 @@ use crate::{
         security::Security,
     },
 };
+use mail_builder::mime::make_boundary;
 use registry::schema::{
     enums::{AcmeChallengeType, ClusterTaskType, ProviderInfo, ServiceProtocol},
-    prelude::ObjectType,
+    prelude::{ObjectType, Property},
     structs::{
         self, AcmeProvider, Asn, ClusterTaskGroup, HttpForm, MailExchanger, Rate, Service,
         SystemSettings, TaskManager,
@@ -62,6 +63,7 @@ pub struct Http {
     pub allowed_endpoint: IfBlock,
     pub response_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     pub use_forwarded: bool,
+    pub redirect_root: Option<String>,
 }
 
 #[derive(Clone)]
@@ -362,6 +364,10 @@ impl Network {
 
         network
     }
+
+    pub fn message_id(&self) -> String {
+        format!("{}@{}", make_boundary("."), self.server_name)
+    }
 }
 
 impl Http {
@@ -442,12 +448,24 @@ impl Http {
             } else {
                 String::new()
             },
-            allowed_endpoint: bp
-                .compile_expr(ObjectType::Http.singleton(), &http.ctx_allowed_endpoints()),
-            rate_authenticated: http.rate_limit_authenticated,
-            rate_anonymous: http.rate_limit_anonymous,
+            allowed_endpoint: if bp.registry.is_recovery_mode() {
+                IfBlock::empty(ObjectType::Http.singleton(), Property::AllowedEndpoints)
+            } else {
+                bp.compile_expr(ObjectType::Http.singleton(), &http.ctx_allowed_endpoints())
+            },
+            rate_authenticated: if bp.registry.is_recovery_mode() {
+                None
+            } else {
+                http.rate_limit_authenticated
+            },
+            rate_anonymous: if bp.registry.is_recovery_mode() {
+                None
+            } else {
+                http.rate_limit_anonymous
+            },
             response_headers: http_headers,
             use_forwarded: http.use_x_forwarded,
+            redirect_root: http.redirect_root,
         }
     }
 }

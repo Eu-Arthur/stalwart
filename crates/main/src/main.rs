@@ -9,6 +9,8 @@
 #![warn(clippy::cast_possible_wrap)]
 #![warn(clippy::cast_sign_loss)]
 
+#[cfg(target_os = "linux")]
+use common::manager::systemd::ServiceState;
 use common::{BuildServer, config::server::ServerProtocol, manager::boot::BootManager};
 use http::HttpSessionManager;
 use imap::core::ImapSessionManager;
@@ -20,13 +22,19 @@ use std::time::Duration;
 use trc::Collector;
 use utils::wait_for_shutdown;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse4.2",
+    any(target_os = "linux", target_os = "freebsd")
+))]
+mod cpu;
 #[cfg(feature = "dev_mode")]
 pub mod test_data;
 
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -36,6 +44,9 @@ async fn main() -> std::io::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install aws-lc-rs as the default rustls crypto provider");
+
+    // Build the shared outbound TLS configurations
+    utils::http::init_shared_tls_configs();
 
     // Load config and apply macros
     let mut init = Box::pin(BootManager::init()).await;
@@ -112,8 +123,14 @@ async fn main() -> std::io::Result<()> {
     // Start broadcast subscriber
     spawn_broadcast_subscriber(init.inner, shutdown_rx);
 
+    #[cfg(target_os = "linux")]
+    ServiceState::Ready.notify();
+
     // Wait for shutdown signal
     wait_for_shutdown().await;
+
+    #[cfg(target_os = "linux")]
+    ServiceState::Stopping.notify();
 
     // Shutdown collector
     Collector::shutdown();

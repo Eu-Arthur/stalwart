@@ -46,7 +46,7 @@ impl EmailSubmissionGet for Server {
         &self,
         mut request: GetRequest<email_submission::EmailSubmission>,
     ) -> trc::Result<GetResponse<email_submission::EmailSubmission>> {
-        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
+        let (ids, not_found_ids) = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             EmailSubmissionProperty::Id,
             EmailSubmissionProperty::EmailId,
@@ -70,7 +70,7 @@ impl EmailSubmissionGet for Server {
                     IterateParams::new(
                         ValueKey {
                             account_id,
-                            collection: Collection::CalendarEventNotification.into(),
+                            collection: Collection::EmailSubmission.into(),
                             document_id: 0,
                             class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
                                 property: EmailSubmissionField::Metadata.into(),
@@ -79,7 +79,7 @@ impl EmailSubmissionGet for Server {
                         },
                         ValueKey {
                             account_id,
-                            collection: Collection::CalendarEventNotification.into(),
+                            collection: Collection::EmailSubmission.into(),
                             document_id: 0,
                             class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
                                 property: EmailSubmissionField::Metadata.into(),
@@ -107,7 +107,7 @@ impl EmailSubmissionGet for Server {
                 .await?
                 .into(),
             list: Vec::with_capacity(ids.len()),
-            not_found: vec![],
+            not_found: not_found_ids,
         };
 
         for id in ids {
@@ -124,7 +124,7 @@ impl EmailSubmissionGet for Server {
             {
                 submission
             } else {
-                response.not_found.push(id);
+                response.push_not_found(id);
                 continue;
             };
             let submission = submission_
@@ -137,41 +137,52 @@ impl EmailSubmissionGet for Server {
                 .iter()
                 .map(|(k, v)| (k.to_string(), DeliveryStatus::from(v)))
                 .collect::<VecMap<_, _>>();
-            let mut is_pending = false;
-            if let Some(queue_id) = submission.queue_id.as_ref().map(u64::from)
-                && let Some(queued_message_) = self
+            let mut queued_status = None;
+            if let Some(queue_id) = submission.queue_id.as_ref().map(u64::from) {
+                if let Some(queued_message_) = self
                     .read_message_archive(queue_id)
                     .await
                     .caused_by(trc::location!())?
-            {
-                let queued_message = queued_message_
-                    .unarchive::<Message>()
-                    .caused_by(trc::location!())?;
-                for rcpt in queued_message.recipients.iter() {
-                    *delivery_status.get_mut_or_insert(rcpt.address().to_string()) =
-                        DeliveryStatus {
-                            smtp_reply: match &rcpt.status {
-                                ArchivedStatus::Completed(reply) => {
-                                    format_archived_response(&reply.response)
-                                }
-                                ArchivedStatus::TemporaryFailure(reply)
-                                | ArchivedStatus::PermanentFailure(reply) => {
-                                    format_archived_error_details(reply)
-                                }
-                                ArchivedStatus::Scheduled => "250 2.1.5 Queued".to_string(),
-                            },
-                            delivered: match &rcpt.status {
-                                ArchivedStatus::Scheduled | ArchivedStatus::TemporaryFailure(_) => {
-                                    Delivered::Queued
-                                }
-                                ArchivedStatus::Completed(_) => Delivered::Yes,
-                                ArchivedStatus::PermanentFailure(_) => Delivered::No,
-                            },
-                            displayed: false,
-                        };
+                {
+                    let queued_message = queued_message_
+                        .unarchive::<Message>()
+                        .caused_by(trc::location!())?;
+                    for rcpt in queued_message.recipients.iter() {
+                        *delivery_status.get_mut_or_insert(rcpt.address().to_string()) =
+                            DeliveryStatus {
+                                smtp_reply: match &rcpt.status {
+                                    ArchivedStatus::Completed(reply) => {
+                                        format_archived_response(&reply.response)
+                                    }
+                                    ArchivedStatus::TemporaryFailure(reply)
+                                    | ArchivedStatus::PermanentFailure(reply) => {
+                                        format_archived_error_details(reply)
+                                    }
+                                    ArchivedStatus::Scheduled => "250 2.1.5 Queued".to_string(),
+                                },
+                                delivered: match &rcpt.status {
+                                    ArchivedStatus::Scheduled
+                                    | ArchivedStatus::TemporaryFailure(_) => Delivered::Queued,
+                                    ArchivedStatus::Completed(_) => Delivered::Yes,
+                                    ArchivedStatus::PermanentFailure(_) => Delivered::No,
+                                },
+                                displayed: false,
+                            };
+                    }
+                    queued_status = email_submission::UndoStatus::Pending.into();
+                } else {
+                    queued_status = email_submission::UndoStatus::Final.into();
                 }
-                is_pending = true;
             }
+            let undo_status = match submission.undo_status {
+                ArchivedUndoStatus::Canceled => email_submission::UndoStatus::Canceled,
+                ArchivedUndoStatus::Pending => {
+                    queued_status.unwrap_or(email_submission::UndoStatus::Pending)
+                }
+                ArchivedUndoStatus::Final => {
+                    queued_status.unwrap_or(email_submission::UndoStatus::Final)
+                }
+            };
 
             let mut result = Map::with_capacity(properties.len());
             for property in &properties {
@@ -215,19 +226,7 @@ impl EmailSubmissionGet for Server {
                         Value::Object(status)
                     }
                     EmailSubmissionProperty::UndoStatus => {
-                        Value::Element(EmailSubmissionValue::UndoStatus(if is_pending {
-                            email_submission::UndoStatus::Pending
-                        } else {
-                            match submission.undo_status {
-                                ArchivedUndoStatus::Pending => {
-                                    email_submission::UndoStatus::Pending
-                                }
-                                ArchivedUndoStatus::Final => email_submission::UndoStatus::Final,
-                                ArchivedUndoStatus::Canceled => {
-                                    email_submission::UndoStatus::Canceled
-                                }
-                            }
-                        }))
+                        Value::Element(EmailSubmissionValue::UndoStatus(undo_status.clone()))
                     }
                     EmailSubmissionProperty::EmailId => Value::Element(
                         Id::from_parts(

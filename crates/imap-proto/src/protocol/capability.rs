@@ -46,7 +46,7 @@ pub enum Capability {
     LiteralPlus, //LITERAL+
     UnAuthenticate,
     StatusSize, //STATUS=SIZE
-    ObjectId,
+    ObjectIdPlus,
     Preview,
     Utf8Accept,
     Auth(Mechanism),
@@ -54,16 +54,11 @@ pub enum Capability {
     QuotaResource(QuotaResourceName),
     QuotaSet,
     JmapAccess,
+    UidOnly,
+    UidBatches,
+    MessageLimit(u32),
+    SaveLimit(u32),
 }
-
-/*
-
-STORAGE 	The physical space estimate, in units of 1024 octets, of the mailboxes governed by the quota root. 	DELETED-STORAGE STATUS request data item and response data item 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.1]
-MESSAGE 	The number of messages stored within the mailboxes governed by the quota root. 	DELETED STATUS request data item and response data item 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.2]
-MAILBOX 	The number of mailboxes governed by the quota root. 	N/A 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.3]
-ANNOTATION-STORAGE
-
-*/
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuotaResourceName {
@@ -90,7 +85,7 @@ impl Capability {
             Capability::LiteralPlus => b"LITERAL+",
             Capability::UnAuthenticate => b"UNAUTHENTICATE",
             Capability::StatusSize => b"STATUS=SIZE",
-            Capability::ObjectId => b"OBJECTID",
+            Capability::ObjectIdPlus => b"OBJECTID+",
             Capability::Preview => b"PREVIEW",
             Capability::Idle => b"IDLE",
             Capability::Namespace => b"NAMESPACE",
@@ -130,10 +125,28 @@ impl Capability {
             }
             Capability::QuotaSet => b"QUOTA=SET",
             Capability::JmapAccess => b"JMAPACCESS",
+            Capability::UidOnly => b"UIDONLY",
+            Capability::UidBatches => b"UIDBATCHES",
+            Capability::MessageLimit(limit) => {
+                buf.extend_from_slice(b"MESSAGELIMIT=");
+                buf.extend_from_slice(limit.to_string().as_bytes());
+                return;
+            }
+            Capability::SaveLimit(limit) => {
+                buf.extend_from_slice(b"SAVELIMIT=");
+                buf.extend_from_slice(limit.to_string().as_bytes());
+                return;
+            }
         });
     }
 
-    pub fn all_capabilities(is_authenticated: bool, offer_tls: bool) -> Vec<Capability> {
+    pub fn all_capabilities(
+        is_authenticated: bool,
+        offer_tls: bool,
+        allow_auth: bool,
+        message_limit: u32,
+        save_limit: u32,
+    ) -> Vec<Capability> {
         let mut capabilities = vec![
             Capability::IMAP4rev2,
             Capability::IMAP4rev1,
@@ -142,11 +155,11 @@ impl Capability {
             Capability::LiteralPlus,
             Capability::Id,
             Capability::Utf8Accept,
-            Capability::JmapAccess,
         ];
 
         if is_authenticated {
             capabilities.extend([
+                Capability::JmapAccess,
                 Capability::Idle,
                 Capability::Namespace,
                 Capability::Children,
@@ -171,18 +184,24 @@ impl Capability {
                 Capability::QResync,
                 Capability::UnAuthenticate,
                 Capability::StatusSize,
-                Capability::ObjectId,
+                Capability::ObjectIdPlus,
                 Capability::Preview,
                 Capability::Rights,
                 Capability::Quota,
                 Capability::QuotaResource(QuotaResourceName::Storage),
+                Capability::UidOnly,
+                Capability::UidBatches,
+                Capability::MessageLimit(message_limit),
+                Capability::SaveLimit(save_limit),
             ]);
-        } else {
+        } else if allow_auth {
             capabilities.extend([
                 Capability::Auth(Mechanism::Plain),
                 Capability::Auth(Mechanism::OAuthBearer),
                 Capability::Auth(Mechanism::XOauth2),
             ]);
+        } else {
+            capabilities.push(Capability::LoginDisabled);
         }
         if offer_tls {
             capabilities.push(Capability::StartTLS);

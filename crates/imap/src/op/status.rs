@@ -15,13 +15,16 @@ use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use imap_proto::{
     Command, ResponseCode, StatusResponse,
     parser::PushUnique,
-    protocol::status::{Status, StatusItem, StatusItemType},
+    protocol::{
+        ObjectId,
+        status::{Status, StatusItem, StatusItemType},
+    },
     receiver::Request,
 };
 use registry::schema::enums::Permission;
 use std::time::Instant;
 use trc::AddContext;
-use types::{id::Id, keyword::Keyword};
+use types::{acl::Acl, id::Id, keyword::Keyword};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_status(&mut self, requests: Vec<Request<Command>>) -> trc::Result<()> {
@@ -29,49 +32,80 @@ impl<T: SessionStream> Session<T> {
         self.assert_has_permission(Permission::ImapStatus)?;
 
         let is_utf8 = self.is_utf8;
+
+        // Parse requests and activate OBJECTID+ if the OBJECTID attribute is requested
+        let mut parsed = Vec::with_capacity(requests.len());
+        let mut activate = false;
+        for request in requests {
+            match request.parse_status(is_utf8) {
+                Ok(arguments) => {
+                    if arguments.items.contains(&Status::ObjectId) {
+                        activate = true;
+                    }
+                    parsed.push(Ok(arguments));
+                }
+                Err(err) => parsed.push(Err(err)),
+            }
+        }
+        if activate && let Some(enabled) = self.activate_objectid() {
+            self.write_bytes(enabled).await?;
+        }
+
         let data = self.state.session_data();
 
         spawn_op!(data, {
             let mut did_sync = false;
 
-            for request in requests.into_iter() {
-                match request.parse_status(is_utf8) {
+            for request in parsed {
+                match request {
                     Ok(arguments) => {
                         let op_start = Instant::now();
-                        if !did_sync {
+                        let synchronized = if did_sync {
+                            Ok(())
+                        } else {
                             // Refresh mailboxes
                             data.synchronize_mailboxes(false)
                                 .await
-                                .imap_ctx(&arguments.tag, trc::location!())?;
-                            did_sync = true;
-                        }
+                                .imap_ctx(&arguments.tag, trc::location!())
+                                .map(|_| ())
+                        };
 
                         // Fetch status
-                        let status = data
-                            .status(arguments.mailbox_name, &arguments.items)
-                            .await
-                            .imap_ctx(&arguments.tag, trc::location!())?;
+                        let status = match synchronized {
+                            Ok(()) => {
+                                did_sync = true;
+                                data.status(arguments.mailbox_name, &arguments.items)
+                                    .await
+                                    .imap_ctx(&arguments.tag, trc::location!())
+                            }
+                            Err(err) => Err(err),
+                        };
 
-                        trc::event!(
-                            Imap(trc::ImapEvent::Status),
-                            SpanId = data.session_id,
-                            MailboxName = status.mailbox_name.clone(),
-                            Details = arguments
-                                .items
-                                .iter()
-                                .map(|c| trc::Value::from(format!("{c:?}")))
-                                .collect::<Vec<_>>(),
-                            Elapsed = op_start.elapsed()
-                        );
+                        match status {
+                            Ok(status) => {
+                                trc::event!(
+                                    Imap(trc::ImapEvent::Status),
+                                    SpanId = data.session_id,
+                                    MailboxName = status.mailbox_name.clone(),
+                                    Details = arguments
+                                        .items
+                                        .iter()
+                                        .map(|c| trc::Value::from(format!("{c:?}")))
+                                        .collect::<Vec<_>>(),
+                                    Elapsed = op_start.elapsed()
+                                );
 
-                        let mut buf = Vec::with_capacity(32);
-                        status.serialize(&mut buf, is_utf8);
-                        data.write_bytes(
-                            StatusResponse::completed(Command::Status)
-                                .with_tag(arguments.tag)
-                                .serialize(buf),
-                        )
-                        .await?;
+                                let mut buf = Vec::with_capacity(32);
+                                status.serialize(&mut buf, is_utf8);
+                                data.write_bytes(
+                                    StatusResponse::completed(Command::Status)
+                                        .with_tag(arguments.tag)
+                                        .serialize(buf),
+                                )
+                                .await?;
+                            }
+                            Err(err) => data.write_error(err).await?,
+                        }
                     }
                     Err(err) => data.write_error(err).await?,
                 }
@@ -114,7 +148,9 @@ impl<T: SessionStream> SessionData<T> {
                                     Status::UidNext | Status::UidValidity => {
                                         StatusItemType::Number(1)
                                     }
-                                    Status::MailboxId => StatusItemType::String("none".into()),
+                                    Status::ObjectId => {
+                                        StatusItemType::ObjectId(ObjectId::default())
+                                    }
                                 },
                             )
                         })
@@ -127,6 +163,17 @@ impl<T: SessionStream> SessionData<T> {
                     .code(ResponseCode::NonExistent))
             };
         };
+
+        if !self
+            .check_mailbox_acl(mailbox.account_id, mailbox.mailbox_id, Acl::ReadItems)
+            .await
+            .caused_by(trc::location!())?
+        {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details("You do not have the required permissions to read this mailbox.")
+                .code(ResponseCode::NoPerm));
+        }
 
         // Make sure all requested fields are up to date
         let mut items_update = Vec::with_capacity(items.len());
@@ -184,13 +231,14 @@ impl<T: SessionStream> SessionData<T> {
                                 StatusItemType::Number(account.last_change_id.to_modseq()),
                             ));
                         }
-                        Status::MailboxId => {
+                        Status::ObjectId => {
                             items_response.push((
                                 *item,
-                                StatusItemType::String(
-                                    Id::from_parts(mailbox.account_id, mailbox.mailbox_id)
-                                        .to_string(),
-                                ),
+                                StatusItemType::ObjectId(ObjectId {
+                                    mailbox_id: Some(Id::from(mailbox.mailbox_id)),
+                                    account_id: Some(Id::from(mailbox.account_id)),
+                                    ..Default::default()
+                                }),
                             ));
                         }
                         Status::Recent => {

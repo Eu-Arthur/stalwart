@@ -2,6 +2,11 @@ name: Build Stalwart FoundationDB
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.fdb
+      - .github/workflows/build-foundationdb.yml
   schedule:
     - cron: "0 */6 * * *"
 
